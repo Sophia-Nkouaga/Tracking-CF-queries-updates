@@ -25,6 +25,7 @@ SELECT lad.loan_account_id,
 	   
 	  	   
 FROM powerhub_reporting.eea_loan_account_details lad
+left join powerhub -- add alms performance benchmark details
 LEFT JOIN sensitive.finance_global_finance_report_monthly_alms l on l.loan_id = lad.loan_account_id
 LEFT JOIN sensitive.finance_global_finance_calculations_monthly_alms c on c.loan_id = lad.loan_account_id and l.report_date = c.report_date
 WHERE l.report_date = last_day(lad.last_benchmark_date)

@@ -1,0 +1,490 @@
+/*Fenix accounts*/
+with payment_source as (
+        select * from
+            (
+            /*PAYMENT source*/
+            SELECT
+                cp.primary_phone AS user_phone,
+                cp.secondary_phones AS user_secondary_phone,
+                cp.alternate_contacts AS alternate_phone,
+                /*payment phone_numer*/
+                CASE WHEN  left(fp.sender, 1) = '+' THEN fp.sender ELSE '+' || fp.sender  END AS sender_phone,
+                /*If we have the sender in the data*/
+                cpn1.person_id AS sender_id,
+                cpn1.first_name || ' ' || cpn1.last_name AS sender_name,
+                cpn1.fenixdb_user_id AS sender_fenixdb_user,
+                rcat.account_id AS sender_customer,
+                /*Associator_data*/
+                dd.associator_name as associate_name,
+                dd.associator_phone as associate_phone,
+                ROW_NUMBER() over (partition by cpn1.person_id order by  date(sd.start_date_utc) asc) rn
+            FROM powerhub_reporting.reporting_account_transactions AS rcat
+                LEFT JOIN sensitive.finance_payments AS fp ON rcat.payment_id = fp.id
+                LEFT JOIN powerhub_reporting.reporting_account_current_details AS rca ON rcat.account_id = rca.account_id
+                /*user id details*/
+                LEFT JOIN sensitive.person_sensitive AS cp ON rca.user_id = cp.person_id
+                /*sender details*/
+                LEFT JOIN sensitive.person_sensitive AS cpn1 ON CASE WHEN
+                left(fp.sender, 1) = '+' THEN fp.sender
+                         ELSE  '+' || fp.sender
+                         END = cpn1.primary_phone
+                /*sender sales details*/
+                LEFT JOIN powerhub_reporting.reporting_sales_details sd ON sd.customer_id = cpn1.person_id AND sd.sales_order_count = 1
+                    /*get associator_details*/
+                LEFT JOIN (
+                    SELECT
+                        sd.account_id,
+                        sd.associator_name,
+                        ps.primary_phone AS associator_phone
+                    FROM
+                        powerhub_reporting.reporting_sales_details sd
+                        LEFT JOIN sensitive.person_sensitive ps ON ps.person_id = sd.associator_id
+                    WHERE
+                        sales_order_count = 1) AS dd ON dd.account_id = rcat.account_id
+                /*limit to deposits and payments and accounts created made in 2021*/
+            WHERE (rcat.transaction_type_id = 4
+                OR rcat.transaction_type_id = 2)
+            AND payment_id IS NOT NULL
+            )where rn = 1
+)
+     
+  --FENIX  
+     
+select
+       'paygo'as loan_type,
+         acd.account_id,
+         acd.customer_id,
+       acd.country,
+       cast( acd.account_start_date as date),
+       acd.account_days_locked,
+       acd.account_percent_locked,
+       acd.account_days_til_lockout,
+       acd.account_max_consecutive_days_locked,
+       acd.account_state,
+       
+       
+        mfp.first_payment_due,
+     mfp.first_payment_due as daily_first_payment_due_date,
+        mfp.first_payment_due_monthly as monthly_first_payment_due_date,
+        
+        mfp.first_payment_due_w_grace,
+        mfp.first_payment_due_monthly_w_grace,
+
+       mfp.missed_first_payment as late_dummy,
+       
+      mfp.missed_first_payment as late_dummy_daily,
+      
+      mfp.missed_first_payment_monthly as late_dummy_monthly,
+
+            
+    
+     --  di.days_issued as days_issued_day_0,
+       mfp.days_issued_sale_date as days_issued_day_0,
+       sd.associator_location,
+       sd.sale_location,
+       sd.product_category,
+       sd.product_type,
+       sd.payment_plan,
+       ptm.product_group_name,
+       ptm.wattage ||'W'as system_size,
+       sd.deposit_amount,
+       sd.loan_duration,
+       sd.daily_rate,
+       sd.associator_id ||'f' as associator_id,
+       sd.associator_role,
+       sd.associator_name,
+       sd.associator_manager_id ||'f' as associator_manager_id,
+       sd.associator_manager_name,
+       sd.manager_role,
+       pd.region as "zone",
+      case when sd.country_of_sale = 'Uganda' then loc.region else  pd.region end region,
+       pd.subcounty,
+       pd.district,
+       pd.parish,
+       pd.occupation,
+       pd.gender,
+       pd.age,
+       (ps.first_name + ' ' + ps.last_name)  as customer_name,
+       ps.primary_phone as primary_phone_number,
+       ps.secondary_phones as secondary_phone_number,
+       pd.primary_language,
+       pd.messaging_language,
+       sd.sales_order_count,
+       sd.introductory_period,
+        sd.loan_duration / 30 as installment_periods,
+       sd.daily_rate * 30 as initial_installment,
+       cast(lcd.cancellation_date_utc as date),
+       cast(lcd.payoff_date_utc as date),
+       0 coop_loan,
+        (case when lcd.prepaid_days_remaining < 0 then lcd.prepaid_days_remaining*-1 else 0 end) as par_days,
+       'Fenix' AS company,
+       lcd.cancellation_reason,
+       lcd.amount_remaining_interest_accrued_to_date,
+       lcd.amount_remaining_all_interest,
+       sd.total_interest,
+       sd.total_principal,
+       (lcd.paid_principal + lcd.paid_interest) as amount_paid,      
+       lcd.amount_expected as expected_amount,
+  
+
+
+          
+        pyts.user_phone,
+    pyts.user_secondary_phone,
+        pyts.alternate_phone,
+        pyts.sender_phone,
+        pyts.sender_id,
+        pyts.sender_name,
+        pyts.sender_fenixdb_user,
+        pyts.associate_name,
+    pyts.associate_phone
+        from powerhub_reporting.reporting_account_current_details acd 
+       left join analysts_inputs.market_sources_customer_finance_missed_first_payment_mv mfp on mfp.account_id = acd.account_id 
+         /*left join (select account_id, days_issued 
+                    from reporting.account_daily_metrics 
+                    where days_elapsed = 0           and datediff(day, account_started_at_utc, benchmark_date) <= 1           ) as di on di.account_id = acd.account_id*/
+                
+                    
+        left join powerhub_reporting.reporting_sales_details sd on acd.account_id = sd.account_id and sd.sales_order_count = 1
+        left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type = sd.product_type
+        left join powerhub_reporting.reporting_person_demographics pd on sd.customer_id = pd.person_id
+        left join sensitive.person_sensitive ps ON ps.person_id = sd.customer_id_fenixdb
+        left join powerhub_reporting.reporting_loan_current_details lcd on lcd.account_id = acd.account_id and lcd.loan_id = sd.loan_id
+        left join payment_source pyts on pyts.sender_customer = acd.account_id
+  /*waiting*/      left join analysts_inputs.market_sources_ug_locations loc on COALESCE(sd.sale_location,sd.associator_location)  = loc.location
+   
+        
+         where sd.country_of_sale not like '%Senegal%'
+--and acd.account_id in( 'GB3662','YHRTQQ')
+    and sd.country_of_sale is not null
+
+
+
+UNION
+
+
+        /*MOBISOL DATA*/
+       select  
+    
+   
+   chlas.loan_type,
+                chlas.customer_id as account_id,
+                chlas.customer_id,
+                ctry.name  AS country,
+                date(chlas.handover_at_utc) AS account_start_date,
+                chlas.days_locked as account_days_locked,
+    
+               cast  (chlas.percent_locked  as float) as account_percent_locked,
+                
+                
+                 chlas.days_til_lockout as account_days_til_lockout,
+                chlas.days_locked as account_max_consecutive_days_locked,
+                chlas.state as account_state,
+     
+
+       mfp.first_payment_due,
+     mfp.first_payment_due as daily_first_payment_due_date,
+        mfp.first_payment_due_monthly as monthly_first_payment_due_date,
+        
+        mfp.first_payment_due_w_grace,
+        mfp.first_payment_due_monthly_w_grace,
+
+       mfp.missed_first_payment as late_dummy,
+       
+      mfp.missed_first_payment as late_dummy_daily,
+      
+      mfp.missed_first_payment_monthly as late_dummy_monthly,
+
+
+        mfp.days_issued_sale_date as days_issued_day_0,
+
+                case when cd.country = 'RW' then tra.region else cd.area1 end as associator_location,
+            
+                sc.hub_name as sale_location,
+       
+                soi.fenix_product_category  AS product_category,
+                
+                soi.product_name as product_type,
+                --one_p.sales_product || ' _ ' || one_p.down_payment || 'dp _ ' || one_p.installment_periods || 'm' 
+                soi.product_name || ' _ ' || soi.down_payment/100 || 'dp _ ' || soi.payment_plan as payment_plan,
+
+                pm.product_group_name,
+
+                pm.wattage ||'W'as system_size,
+                cast(soi.down_payment /100 as float) as  deposit_amount,
+                --cast ((chlas.installment_periods* 30.5)as int)  as loan_duration,
+                soi.loan_duration,
+             --  cast( (chlas.initial_installment/100) / 30.5  as float)AS daily_rate,
+                soi.daily_rate/100 as daily_rate,
+               case when cd.country = 'RW' then  coalesce(tra.sales_agent_id,cd.application_by_contractor_id) else  cd.application_by_contractor_id  end as  associator_id,
+                cd.application_by_contractor_role as associator_role,
+                case when cd.country = 'RW' then COALESCE ( tra.sales_agent, cd.application_by_contractor_name) else cd.application_by_contractor_name end  as associator_name,
+                case when cd.country = 'RW' then coalesce(tra.coordinator_id, cd.application_coordinator_id)  else  cd.application_coordinator_id end as  associator_manager_id,
+   
+                case when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2 (cd.area2),'~',1)
+                when cd.country = 'RW' then  COALESCE (tra.coordinator_name, cd.application_coordinator_name)
+                else cd.application_coordinator_name end as associator_manager_name,
+                
+                cd.application_coordinator_role as manager_role,
+
+               
+        case when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2 (cd.area2),'~',2)
+                 when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',1) 
+/*waiting*/       when cd.country = 'UG' then loc.region 
+             else cd.area1
+ end as   zone,
+        case when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2 (cd.area2),'~',2)
+                 when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',1) 
+/*waiting*/        when cd.country = 'UG' then loc.region 
+        when cd.country = 'RW' then COALESCE ( tra.region, cd.area1)
+             else cd.area1
+ end as region, 
+ 
+               
+          
+               -- case when cd.country = 'TZ' then cd.area1 else cd.area1 end as region,
+                CASE WHEN cd.country = 'TZ' then sc.hub_name
+/*waiting*/                    WHEN cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+                    ELSE cd.area3
+                    END AS "subcounty",
+
+            cd.area2   district,
+
+                null parish,
+                cd.occupation,
+                cd.gender,
+ 
+                (case when cs.birthdate < current_date then date_part('year', CURRENT_DATE) - date_part('year',   cs.birthdate )end) AS age,
+                cs.customer_name as customer_name,
+                cs.primary_phone_number as primary_phone_number,
+                cs.other_phone_numbers as secondary_phone_number,
+                cd.spoken_language AS primary_language,
+                cd.reading_language  AS messaging_language,
+                sales_case_rank as sales_order_count,
+                soi.down_payment_days AS introductory_period,
+                chlas.installment_periods,
+                cast(chlas.initial_installment/100 as float) as initial_installment,
+                date(coalesce(chlas.defaulted_at_utc, chlas.canceled_at_utc, chlas.rescheduled_at_utc)) as          cancellation_date_utc,
+               date( chlas.paid_off_at_utc )as payoff_date_utc,
+                CASE WHEN soi.product_name like 'Cooperative%' THEN  1 ELSE 0  END AS coop_loan,
+    			chlas.par_days as par_days,
+                'Mobisol' as company,
+               chlas.cancel_comment as  cancellation_reason,
+               cast(chlas.amount_remaining/100  as float)as amount_remaining_interest_accrued_to_date,
+               cast(chlas.amount_remaining/100  as float)as amount_remaining_all_interest,
+               0 total_interest,
+               cast(chlas.loan_amount - soi.down_payment as float)/100 as total_principal,
+        
+        
+                   chlas.amount_paid_minus_down_payment/100 as amount_paid,
+                
+                chlas.amount_expected_minus_down_payment/100 as expected_amount,
+
+           
+                null as user_phone,
+                null as user_secondary_phone,
+                null as alternate_phone,
+                null as sender_phone,
+                null as sender_id,
+                null as sender_name,
+                null as sender_fenixdb_user,
+                null as associate_name,
+                null as associate_phone
+  
+          from  (select * from (select l.*, row_number() OVER (PARTITION BY l.customer_id order by s.down_payment desc) as rn from powerhub_reporting.eea_loan_account_details l 
+          left join  powerhub_reporting.eea_sales_order_items s on s.loan_account_id = l.loan_account_id where  master_loan_item = 1  and s.account_type = 'CREDIT' ) where rn = 1) chlas 
+        right join  analysts_inputs.market_sources_customer_finance_missed_first_payment_mv mfp on mfp.customer_id = chlas.customer_id and mfp.loan_id = chlas.loan_account_id
+        left join  powerhub_reporting.eea_sales_order_items soi on soi.loan_account_id = chlas.loan_account_id
+        	and soi.fenix_product_category = 'ReadyPay'
+            and soi.product_line_segment_name = 'ReadyPay'
+            and master_loan_item = 1 
+            and sales_case_rank = 1
+            and soi.account_type = 'CREDIT'
+        left join sensitive.customers_sensitive  cs on cs.customer_id = chlas.customer_id
+
+     left join powerhub_reporting.eea_customer_details  cd  on cd.customer_id = chlas.customer_id
+left join (select distinct area0,area1,country from powerhub_reporting.eea_location_areas where case when country   in  ('TZ','KE', 'RW')  and  area0 is not  null then area0 end = area0 or  case when country  not in  ('TZ','KE', 'RW')  and  area0 is  null then area1  else area0 end = area1) la on la.area1 = cd.area1 and la.country = cd.country
+  
+               /*exclude coop loans*/
+--      left  join  mobisol.cf_util_co_op_loans coop ON coop.loan_account_id = soi.loan_account_id 
+--      left join (select distinct loan_account_id from mobisol.cf_util_return_cases) as curc on curc.loan_account_id = soi.loan_account_id
+      --  left join temp.regional_bussiness_execuitive_mapping_tz t on t.currency=soi.currency and t.district = cd.area2  
+        left join powerhub_reporting.reporting_country ctry on ctry.iso_2_abbreviation = cd.country
+        left join powerhub_reporting.eea_sales_cases sc on sc.sales_case_id = soi.sales_case_id
+/*waiting*/        Left join analysts_inputs.market_sources_rw_sales_agent_mapping tra on tra.sales_agent_id = cd.application_by_contractor_id
+        left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping pm on trim(soi.product_name) = pm.product_type
+        -- left join temp.temp_ke_agents_list tka on tka.sales_agent_id =   cd.application_by_contractor_id  and tka.sales_agent_id is not null and tka.sales_agent_id != ''
+ /*waiting*/   left join analysts_inputs.market_sources_ug_locations loc on trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1))) = loc.location
+                where date(chlas.handover_at_utc) >= '2018-01-01'
+       -- and mfp.customer_id in ('ke_3080077')
+       -- ;and cfp.initial_outstanding >0--and coop_loan<>1 
+        and (soi.product_name is null or soi.product_name not like '%COVID%')
+
+        and soi.installment_amount > 0
+        and soi.account_type = 'CREDIT'
+             
+
+        --and  cfp.currency = 'KES'
+        and cd.country is not null
+   -- and chlas.customer_id  in ( 'tz_1997298','bj_735425')
+and chlas.source = 'admin'
+
+
+
+
+
+
+UNION
+
+/*alms*/
+select
+      
+       lcd.loan_type,
+       mfp.account_id,
+       mfp.customer_id,
+        ctry.name  AS country,
+       cast( lcd.handover_at_utc as date),
+       lcd.days_locked as account_days_locked,
+       lcd.percent_locked as account_percent_locked,
+       lcd.days_til_lockout as account_days_til_lockout,
+       lcd.days_locked as account_max_consecutive_days_locked,
+
+       LOWER(lcd.state) as account_state,
+       
+       
+       
+    mfp.first_payment_due,
+     mfp.first_payment_due as daily_first_payment_due_date,
+        mfp.first_payment_due_monthly as monthly_first_payment_due_date,
+        
+        mfp.first_payment_due_w_grace,
+        mfp.first_payment_due_monthly_w_grace,
+
+       mfp.missed_first_payment as late_dummy,
+       
+      mfp.missed_first_payment as late_dummy_daily,
+      
+      mfp.missed_first_payment_monthly as late_dummy_monthly,
+
+
+            
+    
+     --  di.days_issued as days_issued_day_0,
+       mfp.days_issued_sale_date as days_issued_day_0,
+       
+        cd.area1 as associator_location,
+    sc.hub_name as sale_location,
+    soi.fenix_product_category  AS product_category,
+    soi.product_name,
+    soi.product_name || ' _ ' || soi.down_payment/100 || 'dp _ ' || soi.payment_plan as payment_plan,
+    pm.product_group_name,
+    pm.wattage ||'W'as system_size,
+
+       
+    cast(soi.down_payment /100 as float) as  deposit_amount,
+       soi.loan_duration,
+       soi.daily_rate/100 as daily_rate,
+       
+        cd.application_by_contractor_id as  associator_id,
+        cd.application_by_contractor_role as associator_role,
+        cd.application_by_contractor_name as associator_name,
+        cd.application_coordinator_id as  associator_manager_id,
+        cd.application_by_contractor_name associator_manager_name,
+        cd.application_coordinator_role as manager_role,
+       
+   
+                 
+              case when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2 (cd.area2),'~',2)
+                 when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',1) 
+/*waiting*/       when cd.country = 'UG' then loc.region 
+             else cd.area1
+ end as   zone,
+        case when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2 (cd.area2),'~',2)
+                 when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',1) 
+/*waiting*/        when cd.country = 'UG' then loc.region 
+        when cd.country = 'RW' then COALESCE ( tra.region, cd.area1)
+             else cd.area1
+ end as region, 
+ 
+               
+          
+               -- case when cd.country = 'TZ' then cd.area1 else cd.area1 end as region,
+                CASE WHEN cd.country = 'TZ' then sc.hub_name
+/*waiting*/                    WHEN cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+                    ELSE cd.area3
+                    END AS "subcounty",
+                            cd.area2  AS district,
+        cd.area4 as parish,
+      
+      
+        cd.occupation,
+        cd.gender,
+      (case when cs.birthdate < current_date then date_part('year', CURRENT_DATE) - date_part('year',   cs.birthdate )end) AS age,
+        cs.customer_name as customer_name,
+        cs.primary_phone_number as primary_phone_number,
+        cs.other_phone_numbers as secondary_phone_number,
+        cd.spoken_language AS primary_language,
+        cd.reading_language  AS messaging_language,
+
+      
+ 
+    sales_case_rank as sales_order_count,
+        soi.down_payment_days AS introductory_period,
+        lcd.installment_periods,
+        cast(lcd.initial_installment/100 as float) as initial_installment,
+        date(coalesce(lcd.defaulted_at_utc, lcd.canceled_at_utc, lcd.rescheduled_at_utc)) as cancellation_date_utc,
+        date( lcd.paid_off_at_utc )as payoff_date_utc,
+        CASE WHEN soi.product_name like 'Cooperative%' THEN  1 ELSE 0  END AS coop_loan,
+  (case when lcd.days_til_lockout < 0 then lcd.days_til_lockout*-1 else 0 end) as par_days,
+        'Alms' as company,
+        lcd.cancel_comment as  cancellation_reason,
+        cast(lcd.remaining_principal/100  + lcd.remaining_interest_accrued/100 as float)as amount_remaining_interest_accrued_to_date,
+        cast(lcd.remaining_principal/100  + lcd.remaining_interest_total/100 as float)as amount_remaining_all_interest,
+        soi.total_interest/100 as total_interest,
+        soi.principal_price/100 as total_principal,
+        
+     lcd.amount_paid_minus_down_payment/100 as amount_paid, 
+        lcd.expected_interest/100 + lcd.expected_principal/100 as expected_amount,
+        
+          
+                null as user_phone,
+                null as user_secondary_phone,
+                null as alternate_phone,
+                null as sender_phone,
+                null as sender_id,
+                null as sender_name,
+                null as sender_fenixdb_user,
+                null as associate_name,
+                null as associate_phone
+                
+     
+                
+         
+          from powerhub_reporting.eea_loan_account_details lcd 
+          
+        right join analysts_inputs.market_sources_customer_finance_missed_first_payment_mv mfp on lcd.loan_account_id = mfp.loan_id and lcd.customer_id = mfp.customer_id
+        left join  powerhub_reporting.eea_sales_order_items soi on soi.loan_account_id = lcd.loan_account_id  
+            and soi.fenix_product_category = 'ReadyPay'
+            and soi.product_line_segment_name = 'ReadyPay'
+            and master_loan_item = 1 
+            and sales_case_rank = 1
+            and soi.account_type = 'CREDIT'     
+         left join sensitive.customers_sensitive  cs on cs.customer_id = lcd.customer_id
+         left join powerhub_reporting.eea_customer_details  cd  on cd.customer_id = lcd.customer_id
+/*left join (select distinct area0,area1,area2,area3,area4,country from powerhub_reporting.eea_location_areas where case when country   in  ('TZ','KE', 'RW')  and  area0 is not  null then area0 end = area0 or  case when country  not in  ('TZ','KE', 'RW')  and  area0 is  null then area1  else area0 end = area1) la on la.area1 = cd.area1 and la.country = cd.country*/
+        left join powerhub_reporting.reporting_country ctry on ctry.iso_2_abbreviation = cd.country
+        left join powerhub_reporting.eea_sales_cases sc on sc.sales_case_id = lcd.sales_case_id
+ /*waiting*/   left join analysts_inputs.market_sources_ug_locations loc on trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1))) = loc.location
+        left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping pm on trim(soi.product_name) = pm.product_type
+        
+           Left join analysts_inputs.market_sources_rw_sales_agent_mapping tra on tra.sales_agent_id = cd.application_by_contractor_id
+        
+       --   left join temp.regional_bussiness_execuitive_mapping_tz t on t.currency=soi.currency and t.district = cd.area2  
+       --  left join temp.temp_ke_agents_list tka on tka.sales_agent_id =   cd.application_by_contractor_id  and tka.sales_agent_id is not null and tka.sales_agent_id != ''
+                where date(lcd.handover_at_utc) >= '2018-01-01'
+     -- and mfp.account_id in ('bjl_84746')        
+        and soi.account_type = 'CREDIT'
+        and lcd.source = 'alms'
+        --and  cfp.currency = 'KES'
+       -- AND cd.country = 'KE'
+        and cd.country is not null

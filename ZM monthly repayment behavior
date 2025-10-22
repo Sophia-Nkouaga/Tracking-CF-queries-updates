@@ -1,0 +1,343 @@
+with mode_amount as
+(
+
+/* fenixdb */
+select 
+'paygo' as loan_type,
+ltx.loan_id :: varchar as loan_id, 
+coalesce(lm.months_since_loan_start,'') as months_since_loan_start,
+
+/* customer details */
+cd.customer_id, 
+cs.customer_name, 
+cs.primary_phone_number, 
+nvl(cs.other_phone_numbers,'') as other_phone_numbers, 
+nvl(pd.region,la.area1, '') as region, 
+nvl(pd.district, la.area2, '') as district, 
+coalesce(pd.parish, la.area3, la.area4, '') as parish, 
+nvl(ps.landmark, cs.address|| ',' || cs.directions, '') as direction, 
+
+/* team to follow up details */
+coalesce(cd.adopted_by_contractor_id ,cd.application_by_contractor_id, cd.assigned_to_contractor_id) as assigned_to_agent_id, 
+coalesce((oc.name||' '|| oc.surname),cd.application_by_contractor_name, cd.assigned_to_contractor_name) as assigned_to_agent_name, 
+
+/* product details */
+ptm.product_group_name as product, 
+case when (ptm.wattage >= 80 and ptm.wattage <= 200 ) then 'High end' 
+     when ((ptm.wattage >= 21 and ptm.wattage <= 79) or l.product_type like '%%TV%%' ) then 'Medium'
+     when (ptm.wattage <= 20 ) then 'Entry Level' else 'EXCEPTION' end as product_segmentation,
+     
+     
+/* payment details */
+coalesce(lm.paid_in_month, l.paid_in_month) as paid_mtd, 
+coalesce(lm.expected_in_month_ongoing,l.expected_in_month_ongoing) as expected_ongoing_mtd, 
+coalesce(lm.expected_in_month_total,l.expected_in_month_total) as expected_mtd, 
+
+/* repayment behavior details */
+last_day(date(timezone(ct.default_timezone, ltx.added_at_utc::timestamptz))) as month_end, 
+round((ltx.portion_interest + ltx.portion_principal),0) as trans_amount,
+l.daily_rate, 
+round(trans_amount/l.daily_rate,0) as lighting_days_paid_for, 
+count(distinct ltx.loan_id) as count_loans,
+count(*) as frequency,
+row_number() over (partition by ltx.loan_id, month_end order by frequency desc, trans_amount asc) as rn
+
+from powerhub_reporting.reporting_loan_transactions ltx
+left join sensitive.finance_global_finance_report_daily l on l.loan_id = ltx.loan_id
+left join powerhub_reporting.reporting_country_timezone ct on ltx.country = ct.iso_2_abbreviation
+left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type = l.product_type
+left join sensitive.finance_global_finance_report_monthly lm on lm.loan_id = ltx.loan_id and lm.report_date = last_day(date(timezone(ct.default_timezone, ltx.added_at_utc::timestamptz)))
+
+/* joins to pull customer details */
+left join powerhub_reporting.eea_customer_details cd on cd.customer_id = l.customer_id
+left join powerhub_reporting.ops_contractors oc on oc.contractor_id = cd.adopted_by_contractor_id
+left join sensitive.customers_sensitive cs on cs.customer_id = cd.customer_id 
+left join sensitive.person_sensitive ps on ps.person_id = l.customer_id_fenixdb
+left join powerhub_reporting.reporting_person_demographics pd ON pd.person_id = l.customer_id_fenixdb
+left join powerhub_reporting.eea_location_areas la ON la.location_area_id = cs.location_area_id 
+
+
+where transaction_type_id in (2, 18, 20, 24, 61) and ltx.country like 'ZM' 
+		and date(timezone(ct.default_timezone, ltx.added_at_utc::timestamptz)) > '2023-12-31'
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,ltx.loan_id,l.daily_rate
+
+/* alms */
+
+union 
+
+select 
+
+'paygo' as loan_type,
+alt.loan_id :: varchar as loan_id, 
+coalesce(lm.months_since_loan_start) as months_since_loan_start,
+
+/* customer details */
+cd.customer_id, 
+cs.customer_name, 
+cs.primary_phone_number, 
+nvl(cs.other_phone_numbers,'') as other_phone_numbers, 
+nvl(la.area1,'') as region, 
+nvl(la.area2,'') as district, 
+coalesce(la.area3, la.area4,'') as parish, 
+nvl(cs.address|| ',' || cs.directions, '') as direction, 
+
+/* team to follow up details */
+coalesce(cd.adopted_by_contractor_id ,cd.application_by_contractor_id, cd.assigned_to_contractor_id) as assigned_to_agent_id, 
+coalesce((oc.name||' '|| oc.surname),cd.application_by_contractor_name, cd.assigned_to_contractor_name) as assigned_to_agent_name, 
+
+/* product details */
+ptm.product_group_name as product,
+case when (ptm.wattage >= 80 and ptm.wattage <= 200 ) then 'High end'
+     when ((ptm.wattage >= 21 and ptm.wattage <= 79) or l.product_type  like '%%TV%%' ) then 'Medium'
+     when (ptm.wattage <= 20 )then 'Entry Level' else 'EXCEPTION' end product_segmentation,
+
+/* payment details */
+coalesce(lm.paid_in_month, l.paid_in_month) as paid_mtd, 
+coalesce(lm.expected_in_month_ongoing,l.expected_in_month_ongoing) as expected_ongoing_mtd, 
+coalesce(lm.expected_in_month_total, l.expected_in_month_total) as expected_mtd, 
+
+/* repayment behavior details */
+
+last_day(date(timezone(ct.default_timezone, alt.added_at_utc::timestamptz))) as month_end,
+round((alt.portion_interest + alt.portion_principal)/100,0) as trans_amount, 
+l.daily_rate,
+round(trans_amount/l.daily_rate,0) as lighting_days_paid_for,
+count(distinct alt.loan_id) as count_loans,
+count(distinct alt.id) as frequency,
+row_number() over (partition by alt.loan_id, month_end order by frequency desc, trans_amount asc) as rn
+
+
+from powerhub_reporting.eea_alms_loan_transactions alt
+left join powerhub_reporting.eea_loan_account_details lcd on lcd.loan_account_id = alt.loan_id
+left join sensitive.finance_global_finance_report_daily_alms l on l.loan_id = alt.loan_id
+left join powerhub_reporting.eea_sales_order_items soi on soi.sales_case_id = lcd.sales_case_id
+left join powerhub_reporting.reporting_country_timezone ct on ct.iso_2_abbreviation = soi.country
+left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type = l.product_type
+left join sensitive.finance_global_finance_report_monthly_alms lm on lm.loan_id = alt.loan_id 
+		  and  lm.report_date = last_day(date(timezone(ct.default_timezone, alt.added_at_utc::timestamptz)))
+		  
+/* joins to pull customer details */
+left join powerhub_reporting.eea_customer_details cd on cd.customer_id = l.customer_id
+left join powerhub_reporting.ops_contractors oc on oc.contractor_id = cd.adopted_by_contractor_id
+left join sensitive.customers_sensitive cs on cs.customer_id = cd.customer_id 
+left join powerhub_reporting.eea_location_areas la ON la.location_area_id = cs.location_area_id 
+
+
+where alt.transaction_type in ('Loan Payment', 'Loan Transaction Reversal') 
+and soi.country like 'ZM'
+and date(timezone(ct.default_timezone, alt.added_at_utc::timestamptz)) > '2023-12-31'
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+
+
+/* admin */
+
+union
+
+select 
+
+'arrears' as loan_type,
+pb.loan_account_id :: varchar as loan_id, 
+m.months_on_book as months_since_loan_start,
+
+/* customer details */
+cd.customer_id, 
+cs.customer_name, 
+cs.primary_phone_number, 
+nvl(cs.other_phone_numbers,'') as other_phone_numbers, 
+nvl(la.area1,'') as region, 
+nvl(la.area2,'') as district, 
+coalesce(la.area3, la.area4,'') as parish, 
+nvl(cs.address|| ',' || cs.directions, '') as direction, 
+
+/* team to follow up details */
+coalesce(cd.adopted_by_contractor_id ,cd.application_by_contractor_id, cd.assigned_to_contractor_id) as assigned_to_agent_id, 
+coalesce((oc.name||' '|| oc.surname),cd.application_by_contractor_name, cd.assigned_to_contractor_name) as assigned_to_agent_name, 
+
+/* product details */
+pm.product_group_name as product,
+case when (pm.wattage >= 80 and pm.wattage <= 200 )then 'High end'
+     when ((pm.wattage >= 21 and pm.wattage <= 79) OR soi.product_name  LIKE '%%TV%%' )then 'Medium'
+     when ( pm.wattage <= 20 )then 'Entry Level' else 'EXCEPTION' end Product_segmentation,
+ 
+/* payment details */
+(m.outstanding_amount/100 - d.outstanding_amount/100) as paid_mtd, 
+
+(case when nvl(m.state, d.state)  = 'rescheduled' then  0  
+when cd.country <> 'KE' and lcd.loan_type <> 'paygo' and nvl(m.state, d.state)  = 'canceled'  then 0 
+when nvl(m.state, d.state)  = 'paid_off' then 0  
+when lcd.loan_type = 'paygo' then 
+    ( case  when nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) < soi.down_payment_days then  0             
+    /*when customer is in the first month then only take days elapsed - introperiod */  
+    when (nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) - soi.down_payment_days) <= extract(day from nvl(m.snapshot_at,d.snapshot_at)) then   
+    (nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) - soi.down_payment_days) * (lcd.daily_rate/100) 
+    /*when customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    when nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc)  + soi.down_payment_days > lcd.loan_duration + extract(day from nvl(m.snapshot_at,d.snapshot_at)) then  0   
+    /*when customer is beyond their original loan duration but payoff within the last month then days in the month  
+    are expected  */  
+  	when (nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) ) + soi.down_payment_days > lcd.loan_duration  
+then (extract(day from nvl(m.snapshot_at,d.snapshot_at))  - cast((nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) )as int) - lcd.loan_duration + soi.down_payment_days) * (lcd.daily_rate/100)   
+ 	/*Otherwise, the number days in the month times the daily rate*/  
+    else ((lcd.daily_rate/100)  * extract(day from nvl(m.snapshot_at,d.snapshot_at))) end)
+    
+    when  nvl(m.months_on_book,d.months_on_book) < 2 then  0  
+    when  nvl(m.months_on_book,d.months_on_book) - 2 > lcd.installment_periods then 0  
+    else  nvl(lcd.daily_rate/100, (NVL(lcd.initial_installment,0)/100)/lcd.installment_period_days)* extract(day from nvl(m.snapshot_at,d.snapshot_at))  end) as expected_mtd,
+
+(case when nvl(m.state, d.state) like 'rescheduled' then 0  
+when nvl(m.state, d.state) like 'canceled' then 0 
+when nvl(m.terminated_at, d.terminated_at) is not null then 0  
+when lcd.loan_type = 'paygo' then (
+	case when nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) < soi.down_payment_days then  0             
+		 when (nvl(m.snapshot_at,d.snapshot_at) - date(lcd.handover_at_utc) ) <=  lcd.loan_duration + soi.down_payment_days then (lcd.daily_rate/100) end )
+when nvl(m.months_on_book,d.months_on_book) < 2  then  0  
+when nvl(m.months_on_book,d.months_on_book) - 2 > lcd.installment_periods then  0  
+else  (lcd.daily_rate/100) * extract(day from nvl(m.snapshot_at,d.snapshot_at)) end ) as expected_ongoing_mtd,
+
+/* repayment behavior details */    
+last_day(date(timezone(ct.default_timezone, transaction_at))) as month_end,
+round((pb.amount/100),0) as trans_amount, 
+round(lcd.daily_rate/100,0) as daily_rate,
+round(trans_amount/(lcd.daily_rate/100),0) as lighting_days_paid_for,
+count(distinct pb.loan_account_id) as count_loans,
+count(*) as frequency,
+row_number() over (partition by pb.loan_account_id , month_end order by frequency desc, trans_amount asc) as rn
+
+from powerhub_reporting.eea_payment_bookings pb
+left join powerhub_reporting.eea_loan_account_details lcd on lcd.loan_account_id = pb.loan_account_id 
+left join powerhub_reporting.eea_sales_order_items soi on soi.sales_case_id = lcd.sales_case_id and soi.loan_account_id = pb.loan_account_id
+left join powerhub_reporting.reporting_country_timezone ct on ct.iso_2_abbreviation = soi.country
+left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping pm on trim(soi.product_name) = pm.product_type
+left join analysts_inputs.credit_loan_accounts_daily as d on d.loan_account_id = pb.loan_account_id and d.snapshot_at = last_day(date(timezone(ct.default_timezone, transaction_at)))
+left join analysts_inputs.credit_loan_accounts_daily as m on m.loan_account_id = pb.loan_account_id and m.snapshot_at = d.snapshot_prev_month
+
+/* joins to pull customer details */
+left join powerhub_reporting.eea_customer_details cd on cd.customer_id = d.customer_id
+left join powerhub_reporting.ops_contractors oc on oc.contractor_id = cd.adopted_by_contractor_id
+left join sensitive.customers_sensitive cs on cs.customer_id = cd.customer_id 
+left join powerhub_reporting.eea_location_areas la ON la.location_area_id = cs.location_area_id 
+
+where pb.transaction_type in ('PaymentChargeTransaction','RescueChargeTransaction')
+and date(timezone(ct.default_timezone, transaction_at)) > '2023-12-31'
+and soi.country like 'ZM'
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+
+),
+
+min_max as (
+
+/* fenixdb */
+select 
+ltx.loan_id :: varchar,
+last_day(date(timezone(ct.default_timezone, ltx.added_at_utc::timestamptz))) as month_end,
+count(ltx.id) as total_transactions,
+count(distinct ltx.loan_id) as #_loans,
+max(ltx.portion_interest + ltx.portion_principal) as max_payment,
+min(ltx.portion_interest + ltx.portion_principal) as min_payment,
+round(avg(ltx.portion_interest + ltx.portion_principal),0) as avg_payment
+            		
+from powerhub_reporting.reporting_loan_transactions ltx
+left join powerhub_reporting.reporting_country_timezone ct ON ltx.country = ct.iso_2_abbreviation       
+where transaction_type_id in (2, 18, 20, 24, 61) and ltx.country like 'ZM'
+group by 1,2 
+
+
+/* alms */
+
+union
+
+select 
+alt.loan_id::varchar as loan_id,
+last_day(date(timezone(ct.default_timezone, alt.added_at_utc::timestamptz))) as month_end,
+count(alt.id) as total_transactions,
+count(distinct alt.loan_id) as #_loans,
+max(alt.portion_interest/100 + alt.portion_principal/100) as max_payment,
+min(alt.portion_interest/100 + alt.portion_principal/100) as min_payment,
+round(avg(alt.portion_interest/100 + alt.portion_principal/100),0) as avg_payment
+
+            		
+from powerhub_reporting.eea_alms_loan_transactions alt
+left join powerhub_reporting.eea_loan_account_details lcd on lcd.loan_account_id = alt.loan_id
+left join sensitive.finance_global_finance_report_daily_alms l on l.loan_id = alt.loan_id
+left join powerhub_reporting.eea_sales_order_items soi on soi.sales_case_id = lcd.sales_case_id
+left join powerhub_reporting.reporting_country_timezone ct on ct.iso_2_abbreviation = soi.country
+left join sensitive.finance_global_finance_report_daily_alms al on al.loan_id = alt.loan_id
+
+where alt.transaction_type in ('Loan Payment', 'Loan Transaction Reversal') and soi.country like 'ZM'
+group by 1,2
+
+/* admin */
+union
+
+select 
+
+pb.loan_account_id :: varchar as loan_id, 
+last_day(date(timezone(ct.default_timezone, transaction_at))) as month_end,
+-- to_char(date(timezone(ct.default_timezone, transaction_at)), 'Day') as day_name,
+-- extract(day from date(timezone(ct.default_timezone, transaction_at))) as day_of_month,
+
+count(distinct pb.payment_booking_id) as total_transactions,
+count(distinct pb.loan_account_id) as #_loans,
+max(pb.amount/100) as max_payment,
+min(pb.amount/100) as min_payment,
+round(avg(pb.amount/100),0) as avg_payment
+
+from powerhub_reporting.eea_payment_bookings pb
+left join powerhub_reporting.eea_loan_account_details lcd on lcd.loan_account_id = pb.loan_account_id 
+left join powerhub_reporting.eea_sales_order_items soi on soi.sales_case_id = lcd.sales_case_id
+left join powerhub_reporting.reporting_country_timezone ct on ct.iso_2_abbreviation = soi.country
+
+where pb.transaction_type in ('PaymentChargeTransaction','RescueChargeTransaction')
+and soi.country like 'ZM'
+group by 1,2
+
+
+)
+
+SELECT 
+-- ma.*, mm.total_transactions, mm.max_payment, mm.min_payment, mm.avg_payment
+ma.loan_id,
+ma.loan_type,
+ma.months_since_loan_start,
+ma.customer_id,
+ma.customer_name,
+ma.primary_phone_number,
+ma.other_phone_numbers,
+ma.region,
+ma.district,
+ma.parish,
+ma.direction,
+ma.assigned_to_agent_id,
+ma.assigned_to_agent_name,
+
+ma.product,
+ma.product_segmentation,
+
+round(ma.daily_rate,0) as daily_rate,
+ma.lighting_days_paid_for,
+
+
+case when ma.lighting_days_paid_for BETWEEN 1 AND 2 then 'daily (every 1-2days)'
+when ma.lighting_days_paid_for BETWEEN 3 AND 5 then 'daily(every 3-4days)'
+when ma.lighting_days_paid_for BETWEEN 5 AND 7 then 'Weekly(every 5-7days)'
+when ma.lighting_days_paid_for BETWEEN 12 AND 16 then 'bi-weekly'  
+when ma.lighting_days_paid_for BETWEEN 17 AND 35 then 'monthly'
+when ma.lighting_days_paid_for > 35 then 'beyond monthly' else 'Irregular' end AS frequency_lighting_type,
+
+ma.month_end,
+
+ma.frequency,
+ma.trans_amount as median_amount,
+mm.total_transactions,
+mm.max_payment,
+mm.min_payment,
+mm.avg_payment,
+sum(ma.count_loans) as nb_loans,
+sum(ma.paid_mtd) as paid_mtd,
+sum(ma.expected_ongoing_mtd) as expected_ongoing_mtd,
+sum(ma.expected_mtd) as expected_mtd
+
+from  mode_amount as ma
+left join min_max mm on mm.loan_id = ma.loan_id and mm.month_end = ma.month_end
+where rn = 1  -- and loan_type like 'arrears' -- and ma.season_period = 'Harvest 2025' 
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25
+-- limit 10

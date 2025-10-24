@@ -1,0 +1,1838 @@
+WITH sale_locations AS (
+    SELECT customer_market_hub as hub_name,
+        region sale_region,
+        CASE
+            /* Central */
+            WHEN location = 'Kabwe Hub' THEN 'Kabwe'
+            /* Eastern */
+            WHEN location = 'Sinda POS' THEN 'Petauke'
+            WHEN customer_market_hub = 'ZM-EAS-SIN-01(KIOSK)'
+            AND location = 'Petauke' THEN 'Eastern Kiosk'
+            /* Lusaka */
+            WHEN location = 'Fenix Zambia HQ' THEN 'Kabulonga'
+            WHEN location = 'Iringa' THEN 'Indeco'
+            WHEN location = 'Cairo' THEN 'Indeco'
+            WHEN location = 'Lusaka POS - Remy Hachidau' THEN 'Kabulonga'
+            WHEN location = 'Lusaka POS - Zebron Zimba' THEN 'Indeco'
+            WHEN location = 'Lusaka POS 2 - Owen Sinkala' THEN 'Indeco'
+            WHEN customer_market_hub = 'ZM-LUS-SHI-03 (KIOSK)'
+            AND location = 'Iringa' THEN 'Lusaka Kiosk'
+            /* North-Western*/
+            WHEN customer_market_hub = 'ZM-NW-MUF-02 (KIOSK)'
+            AND location = 'Mufumbwe' THEN 'North-Western Kiosk'
+            /* Northern */
+            WHEN customer_market_hub = 'ZM-NOR-NAK-01 (KIOSK)'
+            AND location = 'Nakonde' THEN 'Northern Kiosk'
+            /* Western */
+            WHEN customer_market_hub = 'ZM-WES-LUK-01(KIOSK)'
+            AND location = 'Lukulu' THEN 'Western Kiosk'
+            ELSE location 
+        END sale_location
+    FROM analysts_inputs.market_sources_zm_sales_manager_mapping
+    GROUP BY customer_market_hub,
+        sale_region,
+        sale_location
+), 
+
+ paygee_calculated_fileds as (
+    /*returns the monthly snapshot per loan for only paygee loans for only calculated fields*/ 
+    select 
+    chla.loan_account_id,
+    chla.customer_id, 
+    chla.snapshot_at,
+    /*prev cols*/  chla.state_prev,
+    chla.outstanding_amount_prev, 
+    chla.par_days_prev, 
+    chla.risk_category_prev, 
+    chla.days_uncharged_prev, 
+    b.snapshot_at as snapshot_at_prev, 
+    b.charged_until as charged_until_prev,
+    datediff(day, date(lad.handover_at_utc), chla.snapshot_at) as days_since_loan_start,
+
+    case when cd.country = 'KE' and (lad.loan_type <> 'paygo' or chla.snapshot_at < '2022-03-21') then 30.5 
+    when lad.loan_type = 'paygo' and cd.country = 'KE' then 7
+    when cd.country in ('TZ', 'RW' ) and lad.loan_type <> 'paygo' then 30.5 
+    else soi.down_payment_days END as introductory_period, /*need to be fixed table/source level*/
+    
+    --NVL(soi.daily_rate/100,(NVL(lad.initial_installment,0)/100)/lad.installment_period_days)as daily_rate, 
+    
+    case when chla.snapshot_at >= '2025-01-31' then lad.daily_rate/100 ELSE  NVL(soi.daily_rate/100,(NVL(lad.initial_installment,0)/100)/lad.installment_period_days) end as daily_rate, 
+       -- (lad.daily_rate/100) as daily_rate,
+
+    NVL(soi.loan_duration,lad.installment_periods * lad.installment_period_days) as loan_duration,
+
+    CAST(CAST(chla.charged_until AS date) - CAST(chla.snapshot_at AS date)
+    AS int) prepaid_days_remaining,
+
+    case when chla.state not in('canceled', 'defaulted', 'paid_off', 'rescheduled') then chla.outstanding_amount else 0 end as ar 
+
+    from
+    analysts_inputs.credit_loan_accounts_monthly chla
+    left join analysts_inputs.credit_loan_accounts_monthly b on b.loan_account_id = chla.loan_account_id  and b.customer_id = chla.customer_id and b.snapshot_at = last_day (add_months(chla.snapshot_at,-1))   
+    left join powerhub_reporting.eea_loan_account_details lad  on lad.loan_account_id  = chla.loan_account_id and lad.customer_id = chla.customer_id
+    left join powerhub_reporting.eea_loan_reschedule_requests resch on resch.resultant_loan_account_id = chla.loan_account_id and chla.customer_id = resch.customer_id
+    LEFT JOIN powerhub_reporting.eea_sales_order_items                                                                                                                                                                                                                                                                             soi ON soi.loan_account_id = chla.loan_account_id AND
+    soi.customer_id = chla.customer_id
+    and soi.master_loan_item = 1 
+    and  soi.account_type = 'CREDIT' 
+    left join powerhub_reporting.eea_customer_details cd on cd.customer_id = chla.customer_id 
+    left join  powerhub_reporting.eea_migrated_loans_from_admin_to_alms m on m.admin_loan_account_id = chla.loan_account_id and m.customer_id = chla.customer_id
+
+  --  WHERE chla.snapshot_at <= '2024-12-31' and chla.snapshot_at >= C_LAST_DAY('2024-12-31',-11) AND '2024-12-31' = LAST_DAY( '2024-12-31')
+    where chla.snapshot_at  >= CURRENT_DATE - INTERVAL '17 MONTH'
+
+    and 
+      date(lad.handover_at_utc) >= '2022-01-01'
+      --or 
+     -- (date(lad.handover_at_utc ) < '2016-01-01' and  chla.state not in('canceled', 'defaulted', 'paid_off', 'rescheduled')))
+     --CHANGE HERE state table updated
+    and lad.initial_installment > 0 and lad.initial_amount > 0 
+    and (chla.external_loan_provider is null or chla.external_loan_provider  not in ('CCT'))
+    and lad.source = 'admin'
+    and (
+      case when cd.country = 'UG' and chla.snapshot_at >= '2023-04-01' and lad.cancel_comment  = 'Migrated to ALMS' then 'yes'
+      when cd.country = 'KE' and chla.snapshot_at >= '2023-09-01' and ((m.migrated_at > '2023-09-07' and m.migrated_at < '2023-09-07'::DATE+ 1) OR (m.migrated_at > '2023-09-05' and m.migrated_at < '2023-09-05'::DATE+1)
+      ) and lad.cancel_comment = 'Migrated to ALMS' then 'yes' 
+      when cd.country = 'KE'  and  chla.snapshot_at >= '2023-11-01' and (m.migrated_at >= '2023-11-01'::DATE+ 1) and lad.cancel_comment = 'Migrated to ALMS' then 'yes'      
+    else 'no' END) = 'no'
+   -- and cd.country = 'RW'
+    --AND chla.loan_account_id in ('ke_374844')
+
+    UNION
+/*daily table union*/
+    select
+
+    a.loan_account_id,
+    a.customer_id, 
+    a.snapshot_at,
+    /*prev cols*/ 
+    b.state as state_prev,
+    b.outstanding_amount/100 as outstanding_amount_prev, 
+    b.par_days as par_days_prev, 
+    b.risk_category as risk_category_prev, 
+    b.days_uncharged as days_uncharged_prev,b.snapshot_at as snapshot_at_prev,
+    b.charged_until as charged_until_prev,
+
+    datediff(day, date(lad.handover_at_utc), a.snapshot_at) as days_since_loan_start,
+
+    case when cd.country = 'KE' and (lad.loan_type <> 'paygo' or a.snapshot_at < '2022-03-21')then 30.5 
+    when lad.loan_type = 'paygo' and cd.country = 'KE' then 7
+    when cd.country in ('TZ', 'RW' ) and lad.loan_type <> 'paygo' then 30.5 
+    else soi.down_payment_days END as introductory_period, /*need to be fixed table/source level*/
+
+   -- NVL(soi.daily_rate/100,(NVL(lad.initial_installment,0)/100)/lad.installment_period_days)as daily_rate, 
+   case when a.snapshot_at >= '2025-01-31' then lad.daily_rate/100 ELSE  NVL(soi.daily_rate/100,(NVL(lad.initial_installment,0)/100)/lad.installment_period_days) end as daily_rate,
+    
+    NVL(soi.loan_duration,lad.installment_periods * lad.installment_period_days) as loan_duration,
+    CAST( CAST(a.charged_until AS date) - CAST(a.snapshot_at AS date) AS int)as prepaid_days_remaining,
+
+    case when a.state not in('canceled', 'defaulted', 'paid_off', 'rescheduled') then a.outstanding_amount/100 else 0 end as ar  
+
+    from analysts_inputs.credit_loan_accounts_daily  a 
+    left join analysts_inputs.credit_loan_accounts_daily b on b.loan_account_id = a.loan_account_id  and b.customer_id  = a.customer_id and b.snapshot_at = last_day (add_months(a.snapshot_at,-1)) 
+    left join powerhub_reporting.eea_loan_account_details lad on  lad.loan_account_id = a.loan_account_id  and      lad.customer_id = a.customer_id
+    LEFT JOIN powerhub_reporting.eea_sales_order_items                                                                                                                                                                                                                                                                              soi ON soi.loan_account_id = lad.loan_account_id AND
+    soi.customer_id = lad.customer_id
+    and soi.master_loan_item = 1 
+    and  soi.account_type = 'CREDIT' 
+    left join powerhub_reporting.eea_customer_details cd on cd.customer_id = lad.customer_id     
+    left join powerhub_reporting.eea_migrated_loans_from_admin_to_alms                                                                                                                                                                                                                                                                  m on m.admin_loan_account_id = a.loan_account_id and m.customer_id = a.customer_id   
+
+    WHERE 
+    (a.snapshot_at = CURRENT_DATE-1 AND CURRENT_DATE-1  <> LAST_DAY(CURRENT_DATE-1 ))
+
+    --AND a.loan_account_id in ('ke_374844')             
+ 
+      and 
+       date(lad.handover_at_utc) >= '2022-01-01' 
+ -- or (date(lad.handover_at_utc ) < '2016-01-01' and  a.state not in('canceled', 'defaulted', 'paid_off', 'rescheduled'))) ----CHANGE HERE  
+    and lad.initial_installment > 0 and lad.initial_amount > 0 
+    and (lad.external_loan_provider is null or lad.external_loan_provider  not in ('CCT'))
+    and lad.source = 'admin'
+    and (case when cd.country = 'UG' and a.snapshot_at >= '2023-04-01'  and lad.cancel_comment  = 'Migrated to ALMS'  then 'yes'
+    when cd.country = 'KE'  and  a.snapshot_at >= '2023-09-01'  and  ((m.migrated_at > '2023-09-07' and m.migrated_at   < '2023-09-07'::DATE+ 1) OR (m.migrated_at > '2023-09-05' and m.migrated_at < '2023-09-05'::DATE+1)
+    ) and lad.cancel_comment  = 'Migrated to ALMS' then 'yes' 
+    when cd.country = 'KE'  and  a.snapshot_at >= '2023-11-01' and (m.migrated_at >= '2023-11-01'::DATE+ 1) and    lad.cancel_comment  = 'Migrated to ALMS' then 'yes'      
+    else 'no' END) = 'no'
+  --  and cd.country = 'RW'
+
+  )
+  
+/* payments as (select loan_id ,last_day(date(added_at_utc))report_date , sum(amount)amount
+from powerhub_reporting.reporting_loan_transactions 
+where  transaction_type_id = 2 
+and date(added_at_utc) >= CURRENT_DATE - INTERVAL '1 YEAR'
+--and  loan_id = 1650829
+group by 1,2)*/
+
+
+  /*main query*/
+--  main_query as (  
+--select count (*)  from (
+    /*FENIX MONTHLY*/
+    /*returns the monthly info  in the query per loan per month*/
+    select
+    -- l.loan_id::VARCHAR as loan_id,
+    'paygo' as loan_type,
+    'fenixdb' as company, 
+    l.country, 
+    ctry.name as country_of_sale,
+
+    l.report_date,
+   -- date(original_loan_started_at_utc) as start_date,
+    extract('year' from original_loan_started_at_utc) as cohort_year_og,
+     extract('month' from original_loan_started_at_utc) as cohort_month_og,
+    l.loan_state,
+    
+    0 as coop,
+    'None' as external_loan_provider, 
+    case when l.rescheduled = TRUE then 1 else 0 end as rescheduled,
+
+ 
+    fx.average_rate as average_rate_usd,
+    fx.end_of_month_rate as eom_rate_usd, 
+
+    (case when country_of_sale = 'Uganda' then loc.region 
+    when country_of_sale = 'Mozambique' then pd.district
+    else pd.region end) as region, 
+    
+    (case when country_of_sale = 'Uganda' then loc.location 
+    when country_of_sale = 'Mozambique' then pd.district
+    else pd.district end) as district, 
+      nvl(sl.sale_location,s.sale_location) as sale_location,
+    
+        NVL(case when country_of_sale = 'Uganda' then t.tl_name else nvl(crm.agent_lead_name,crm2.agent_lead_name) end ,s.associator_manager_name) team_lead_name, 
+   -- NVL(case when country_of_sale = 'Uganda'  then agent.associator_name else crm.sales_agent_name end ,crm2.sales_agent_name,s.associator_name) as sales_agent_name,   
+    -- s.associator_manager_name as recovery_officer,
+    l.product_type as product,
+    case WHEN ptm.base_type = 'Solar Home System' THEN case WHEN ptm.wattage BETWEEN 1 and 10 THEN 'Entry Level'
+    WHEN ptm.wattage < 34 THEN 'Medium' WHEN ptm.wattage >= 34 THEN 'High End' ELSE 'undefined' END END system_size,
+    
+
+    /*period information*/
+    avg(l.days_elapsed) as days_elapsed,
+    avg(l.days_since_loan_start) as days_since_loan_start,
+    avg(months_since_loan_start) as months_since_loan_start,
+
+    avg(l.days_locked) as days_locked,
+    avg(l.percent_locked) as percent_locked,
+    avg(l.loan_duration) as loan_duration,
+    avg(l.daily_rate) as daily_rate,
+    avg(l.days_billable) as days_billable,
+    
+    /*accounts/loans total*/
+    count(l.loan_id) as loans_total,        
+    count(distinct l.account_id)  as accounts_total,
+ 
+
+    sum(case when l.country in ('UGA', 'ZMB', 'NGA') then c.accounts_receivable_net_unfin else                          c.accounts_receivable_all end) as ar,
+
+       sum(case when l.country in ('UGA', 'ZMB', 'NGA') and (l.cancellation_reason is null or l.cancellation_reason != 'Payment Plan Exchange') 
+    then l.total_principal + l.paid_interest + l.unpaid_accrued_interest 
+    when  (l.cancellation_reason is null or l.cancellation_reason != 'Payment Plan Exchange') then l.total_principal + l.total_interest
+    else 0  end) as total_loaned,           
+
+      /*Payemnts info*/   
+
+    sum(l.paid_interest + l.paid_principal) as paid_total,
+    sum(l.paid_deposit) as deposit_amount,
+    sum(case when l.days_since_loan_start <= l.introductory_period then 0   
+    when l.days_since_loan_start > l.loan_duration + l.introductory_period then l.loan_duration * l.daily_rate 
+    else (l.days_since_loan_start - l.introductory_period) *l.daily_rate end) as expected_all_total,
+   
+    sum(l.ready_refer_portion_interest+l.ready_refer_portion_principal+l.other_discounts_portion_interest+l.other_discounts_portion_principal
+    + l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal) as  discounts_amount_total,
+        sum(l.days_discount * l.daily_rate) as discounts_amount_implied_total,
+ 
+
+    count(distinct case when l.paid_in_month > 0 then l.account_id end) as customers_made_payment_mtd,     
+         sum(case when l.paid_in_month > 0 then 1 else 0 end) as loans_made_payment_mtd,
+   
+    
+    sum(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd,
+    avg(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_avg_mtd,
+    sum(l.expected_in_month_total) as expected_all_mtd,
+    sum(l.expected_in_month_in_repayment) as expected_in_repayment_mtd, 
+    sum(l.expected_in_month_ongoing) as expected_ongoing_mtd, 
+    
+    sum(extract('day' from l.report_date))  as days_expected_sum_mtd, 
+    avg(case when l.daily_rate >0 then round(case when l.paid_in_month > 0 then l.paid_in_month else 0 end
+    / l.daily_rate) else NULL end )  as days_paid_avg_mtd, 
+    
+
+    
+/*discounts*/
+    sum(NVL(l.implied_discount_amount_in_month,0))  as discounts_amount_implied_mtd,
+    sum(NVL(l.discount_amount_in_month,0)) as  discounts_amount_mtd,
+    sum(NVL(l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal,0)) as epd_discounts, 
+    sum(NVL(l.other_discounts_portion_interest + l.other_discounts_portion_principal,0)) as other_discounts, 
+    sum(NVL(l.ready_refer_portion_principal + l.ready_refer_portion_principal,0))as referral_discount,
+    sum(NVL(l.fees_portion_interest + l.fees_portion_principal,0)) as fees, 
+
+
+        /*PAR*/ 
+avg(l.prepaid_days_remaining *-1) as par_days,
+
+
+
+    /*payments at periodic months on book 2 and 6*/
+    
+    /*paid at 6 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL(l.paid_in_month , 0) 
+     end,0))as paid_at_6mo,  
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm180.paid_interest + ldm180.paid_principal, 0)
+     end,0)) as cumulative_paid_at_6mo,  
+     
+         sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then ldm180.days_billable * ldm180.daily_rate
+     end,0) )as cumulative_expected_at_6mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then (ldm180.daily_rate)  * extract(day from last_day(ldm180.benchmark_date))
+     end,0)) as expected_at_6mo,  
+
+
+    /*paid at 2 months*/
+ 
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (l.paid_in_month, 0) 
+     end,0 ))as paid_at_2mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (ldm60.paid_interest + ldm60.paid_principal, 0)
+     end,0)) as cumulative_paid_at_2mo, 
+     
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  ldm60.days_billable * ldm60.daily_rate
+     end,0)) as cumulative_expected_at_2mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (ldm60.daily_rate)  * extract(day from last_day(ldm60.benchmark_date))
+     end,0)) as expected_at_2mo,  
+     
+     
+         /*paid at 3 months*/
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (l.paid_in_month, 0) 
+     end,0 ))as paid_at_3mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (ldm90.paid_interest + ldm90.paid_principal, 0)
+     end,0)) as cumulative_paid_at_3mo, 
+     
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  ldm90.days_billable * ldm90.daily_rate
+     end,0)) as cumulative_expected_at_3mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (l.daily_rate)  * extract(day from (l.report_date))
+     end,0)) as expected_at_3mo,  
+    
+          /*PVP*/
+   
+    --paid
+    
+ sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+ when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) and  l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd_pvp,
+
+    --expected
+ -- sum(case when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) then l.expected_in_month_total else 0 end) as expected_all_mtd_pvp,
+    sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+  when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) then l.expected_in_month_total else 0 end) as expected_all_mtd_pvp,
+  
+        /*missed payment data*/
+    count(CASE WHEN last_day(mfp.first_payment_due_w_grace) = last_day(l.report_date) AND mfp.missed_first_payment = 1 THEN mfp.account_id END) AS accounts_due_in_month_and_missed,
+    count(CASE WHEN last_day(mfp.first_payment_due_w_grace) = last_day(l.report_date) and mfp.missed_first_payment is not null THEN mfp.account_id END) AS accounts_due_in_month,
+    count(CASE WHEN last_day(l.original_loan_started_at_utc) = last_day(l.report_date) AND mfp.missed_first_payment = 1 THEN mfp.account_id END) AS accounts_started_in_month_and_missed,
+    count(CASE WHEN last_day(l.original_loan_started_at_utc) = last_day(l.report_date) and mfp.missed_first_payment is not null THEN mfp.account_id END) AS accounts_started_in_month
+
+/*joins*/
+    FROM sensitive.finance_global_finance_report_monthly l 
+    LEFT JOIN powerhub_reporting.reporting_sales_details s ON  l.account_id = s.account_id and l.loan_id = s.loan_id and s.customer_id = l.customer_id
+    left join powerhub_reporting.reporting_country ctry on ctry.iso_3_abbreviation = l.country
+       left join powerhub_reporting.reporting_loan_daily_metrics ldm90 on ldm90.loan_id = l.loan_id and ldm90.days_elapsed = 90  and ldm90.benchmark_date = l.report_date and l.customer_id = ldm90.customer_id and ldm90.benchmark_date >= '2018-01-01'
+    left join powerhub_reporting.reporting_loan_daily_metrics ldm180 on ldm180.loan_id = l.loan_id and ldm180.days_elapsed = 180 and last_day(ldm180.benchmark_date) = l.report_date and l.customer_id = ldm180.customer_id and  ldm180.benchmark_date >= '2018-01-01'
+    LEFT JOIN powerhub_reporting.reporting_loan_daily_metrics ldm60 on ldm60.loan_id = l.loan_id and ldm60.days_elapsed = 60 and last_day(ldm60.benchmark_date) = l.report_date and l.customer_id = ldm60.customer_id 
+    and ldm60.benchmark_date >= '2018-01-01'                       
+    left join sensitive.finance_global_finance_calculations_monthly c on l.account_id = c.account_id and 
+    l.loan_id = c.loan_id and c.report_date = l.report_date  
+    left join sensitive.finance_global_finance_calculations_monthly cprev on l.account_id = cprev.account_id and l.loan_id = cprev.loan_id  and cprev.report_date  =  l.prev_report_date
+    LEFT JOIN powerhub_reporting.reporting_person_demographics pd ON s.customer_id_fenixdb = pd.person_id 
+    left join analysts_inputs.market_sources_ug_locations loc on NVL(s.sale_location,s.associator_location)  = loc.location
+    left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type = l.product_type
+    left join powerhub_reporting.reporting_loan_current_details lcd on lcd.loan_id = l.loan_id and lcd.customer_id = l.customer_id
+    left join powerhub_reporting.reporting_loan_current_details resch_det on resch_det.loan_id = lcd.restructured_base_loan_id and resch_det.customer_id = lcd.customer_id
+    left join analysts_inputs.credit_missed_first_payment mfp on mfp.loan_id = l.loan_id and mfp.account_id = l.account_id
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates fx ON last_day(l.report_date) = fx.month AND ctry.name = fx.country   
+       left join  powerhub_reporting.eea_migrated_loans_from_fenixdb_to_alms mg on lcd.loan_id = mg.fenixdb_loan_id 
+       
+       left join analysts_inputs.vw_global_sales_channel_region_mapping crm on s.order_item_id::VARCHAR(20) = crm.order_item_id 
+                                                        and crm.source = 'FenixDB' 
+                                                        and s.account_id::VARCHAR(20) = crm.account_id 
+                                                        and nvl(s.loan_id::VARCHAR(20),'') = crm.loan_id 
+                                                        and (s.fulfillment_source IS NULL or s.fulfillment_source <> 'Powerhub')
+
+left join powerhub_reporting.eea_sales_order_items so on s.fulfillment_source = 'Powerhub' 
+                                                       and l.loan_id::VARCHAR(20) = so.loan_account_id
+    
+left join analysts_inputs.vw_global_sales_channel_region_mapping crm2 on so.sales_order_item_id = crm2.order_item_id 
+                                                         and crm2.source = 'Solarhub' 
+                                                         and nvl(so.loan_portfolio_id,'') = crm2.account_id 
+                                                         and nvl(so.loan_account_id,'') = crm2.loan_id
+
+
+    
+  
+--left join  analysts_inputs.market_sources_ug_agents agent on NVL(s.sale_location,s.associator_location)  = agent.location2
+
+left join   analysts_inputs.market_sources_ug_team_leaders t on  NVL(s.sale_location,s.associator_location)  = t.pos_locations 
+--left join payments p on p.loan_id = l.loan_id and p.report_date = l.prev_report_date and p.report_date  >= '2022-01-01' 
+
+
+--sales loaction Zambia
+LEFT JOIN sale_locations sl ON s.sale_location = sl.sale_location
+
+ where l.report_date  >= CURRENT_DATE - INTERVAL '13 MONTH'
+
+
+--  and l.account_type = 'CREDIT'
+   /* and ( l.original_loan_started_at_utc >= '2016-01-01' OR (l.original_loan_started_at_utc < '2016-01-01' AND l.loan_state = 'In Repayment'))
+    and ( l.current_loan_started_at_utc >= '2016-01-01' OR (l.current_loan_started_at_utc < '2016-01-01' AND l.loan_state = 'In Repayment'))*/
+    
+    and date( l.original_loan_started_at_utc) >= '2022-01-01'
+
+    --  and l.country = 'KEN'
+    and (l.loan_tag is null or l.loan_tag not like '%%Employee%%')
+    and ( l.cancellation_reason  is null or l.cancellation_reason not  in  ('Exchange'))
+    --and cancellation_reason not in ('Exchange')
+    and l.loan_state is not null
+    and  mg.fenixdb_loan_id is null
+   -- and l.country = 'UGA'
+ -- and l.loan_id = 1827788
+
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
+
+
+    UNION ALL
+
+
+    /*FENIX CURRENT*/ 
+        /*FENIX MONTHLY*/
+    /*returns the monthly info  in the query per loan per month*/
+    select
+    -- l.loan_id::VARCHAR as loan_id,
+    'paygo' as loan_type,
+    'fenixdb' as company, 
+    l.country, 
+    ctry.name as country_of_sale,
+
+    l.report_date,
+   extract('year' from original_loan_started_at_utc) as cohort_year_og,
+     extract('month' from original_loan_started_at_utc) as cohort_month_og,
+    l.loan_state,
+    0 as coop,
+    'None' as external_loan_provider, 
+    case when l.rescheduled = TRUE then 1 else 0 end as rescheduled,
+
+
+ 
+    fx.average_rate as average_rate_usd,
+    fx.end_of_month_rate as eom_rate_usd, 
+
+    (case when country_of_sale = 'Uganda' then loc.region 
+    when country_of_sale = 'Mozambique' then pd.district
+    else pd.region end) as region, 
+    
+   (case when country_of_sale = 'Uganda' then loc.location 
+    when country_of_sale = 'Mozambique' then pd.district
+    else pd.district end) as district, 
+    
+       nvl(sl.sale_location,s.sale_location) as sale_location,
+        NVL(case when country_of_sale = 'Uganda' then t.tl_name else nvl(crm.agent_lead_name,crm2.agent_lead_name) end ,s.associator_manager_name) team_lead_name, 
+  --  NVL(crm.sales_agent_name  ,crm2.sales_agent_name,s.associator_name) as sales_agent_name,  
+    -- s.associator_manager_name as recovery_officer,
+    l.product_type as product,
+    case WHEN ptm.base_type = 'Solar Home System' THEN case WHEN ptm.wattage BETWEEN 1 and 10 THEN 'Entry Level'
+    WHEN ptm.wattage < 34 THEN 'Medium' WHEN ptm.wattage >= 34 THEN 'High End' ELSE 'undefined' END END system_size,
+    
+    
+
+    /*period information*/
+    avg(l.days_elapsed) as days_elapsed,
+    avg(l.days_since_loan_start) as days_since_loan_start,
+    avg(months_since_loan_start) as months_since_loan_start,
+
+    avg(l.days_locked) as days_locked,
+    avg(l.percent_locked) as percent_locked,
+    avg(l.loan_duration) as loan_duration,
+    avg(l.daily_rate) as daily_rate,
+    avg(l.days_billable) as days_billable,
+    
+    /*accounts/loans total*/
+    count(l.loan_id) as loans_total,        
+    count(distinct l.account_id)  as accounts_total,
+ 
+
+    sum(case when l.country in ('UGA', 'ZMB', 'NGA') then c.accounts_receivable_net_unfin else  c.accounts_receivable_all end) as ar,
+
+       sum(case when l.country in ('UGA', 'ZMB', 'NGA') and (l.cancellation_reason is null or l.cancellation_reason != 'Payment Plan Exchange') 
+    then l.total_principal + l.paid_interest + l.unpaid_accrued_interest 
+    when  (l.cancellation_reason is null or l.cancellation_reason != 'Payment Plan Exchange') then l.total_principal + l.total_interest
+    else 0  end) as total_loaned,           
+
+      /*Payemnts info*/   
+
+    sum(l.paid_interest + l.paid_principal) as paid_total,
+    sum(l.paid_deposit) as deposit_amount,
+    sum(case when l.days_since_loan_start <= l.introductory_period then 0   
+    when l.days_since_loan_start > l.loan_duration + l.introductory_period then l.loan_duration * l.daily_rate 
+    else (l.days_since_loan_start - l.introductory_period) *l.daily_rate end) as expected_all_total,
+   
+    sum(l.ready_refer_portion_interest+l.ready_refer_portion_principal+l.other_discounts_portion_interest+l.other_discounts_portion_principal
+    + l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal) as                  discounts_amount_total,
+        sum(l.days_discount * l.daily_rate) as discounts_amount_implied_total,
+ 
+
+    
+    count(distinct case when l.paid_in_month > 0 then l.account_id end) as customers_made_payment_mtd,          sum(case when l.paid_in_month > 0 then 1 else 0 end) as loans_made_payment_mtd,
+ 
+    sum(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd,
+    avg(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_avg_mtd,
+    sum(l.expected_in_month_total) as expected_all_mtd,
+    sum(l.expected_in_month_in_repayment) as expected_in_repayment_mtd, 
+    sum(l.expected_in_month_ongoing) as expected_ongoing_mtd, 
+    
+    sum(extract('day' from l.report_date))  as days_expected_sum_mtd, 
+    avg(case when l.daily_rate >0 then round(case when l.paid_in_month > 0 then l.paid_in_month else 0 end
+    / l.daily_rate) else NULL end )  as days_paid_avg_mtd, 
+    
+
+    
+/*discounts*/
+    sum(NVL(l.implied_discount_amount_in_month,0))  as discounts_amount_implied_mtd,
+    sum(NVL(l.discount_amount_in_month,0)) as  discounts_amount_mtd,
+    sum(NVL(l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal,0)) as epd_discounts, 
+    sum(NVL(l.other_discounts_portion_interest + l.other_discounts_portion_principal,0)) as other_discounts, 
+    sum(NVL(l.ready_refer_portion_principal + l.ready_refer_portion_principal,0))as referral_discount,
+    sum(NVL(l.fees_portion_interest + l.fees_portion_principal,0)) as fees, 
+
+
+        /*PAR*/ 
+avg(l.prepaid_days_remaining *-1) as par_days,
+
+    
+    /*payments at periodic months on book 2 and 6*/
+    
+ 
+    /*paid at 6 months*/
+    /*paid at 6 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (l.paid_in_month , 0) 
+     end,0))as paid_at_6mo,  
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm180.paid_interest + ldm180.paid_principal, 0)
+     end,0)) as cumulative_paid_at_6mo,  
+     
+         sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then ldm180.days_billable * ldm180.daily_rate
+     end,0) )as cumulative_expected_at_6mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then (l.daily_rate)  * extract(day from (l.report_date))
+     end,0)) as expected_at_6mo,  
+
+
+    /*paid at 2 months*/
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (l.paid_in_month, 0) 
+     end,0 ))as paid_at_2mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (ldm60.paid_interest + ldm60.paid_principal, 0)
+     end,0)) as cumulative_paid_at_2mo, 
+     
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  ldm60.days_billable * ldm60.daily_rate
+     end,0)) as cumulative_expected_at_2mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (l.daily_rate)  * extract(day from (l.report_date))
+     end,0)) as expected_at_2mo,  
+
+
+    /*paid at 3 months*/
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (l.paid_in_month, 0) 
+     end,0 ))as paid_at_3mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL (ldm90.paid_interest + ldm90.paid_principal, 0)
+     end,0)) as cumulative_paid_at_3mo, 
+     
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  ldm90.days_billable * ldm90.daily_rate
+     end,0)) as cumulative_expected_at_3mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (l.daily_rate)  * extract(day from (l.report_date))
+     end,0)) as expected_at_3mo,  
+
+      /*PVP*/
+   
+    --paid
+    
+ sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+ when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) and  l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd_pvp,
+
+    --expected
+ -- sum(case when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) then l.expected_in_month_total else 0 end) as expected_all_mtd_pvp,
+  sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+  when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) then l.expected_in_month_total else 0 end) as expected_all_mtd_pvp,
+  
+        /*missed payment data*/
+    count(CASE WHEN last_day(mfp.first_payment_due_w_grace) = last_day(l.report_date) AND mfp.missed_first_payment = 1 THEN mfp.account_id END) AS accounts_due_in_month_and_missed,
+    count(CASE WHEN last_day(mfp.first_payment_due_w_grace) = last_day(l.report_date) and mfp.missed_first_payment is not null THEN mfp.account_id END) AS accounts_due_in_month,
+    count(CASE WHEN last_day(l.original_loan_started_at_utc) = last_day(l.report_date) AND mfp.missed_first_payment = 1 THEN mfp.account_id END) AS accounts_started_in_month_and_missed,
+    count(CASE WHEN last_day(l.original_loan_started_at_utc) = last_day(l.report_date) and mfp.missed_first_payment is not null THEN mfp.account_id END) AS accounts_started_in_month
+
+/*joins*/
+    FROM sensitive.finance_global_finance_report_daily l 
+    LEFT JOIN powerhub_reporting.reporting_sales_details s ON  l.account_id = s.account_id and l.loan_id = s.loan_id and s.customer_id = l.customer_id
+    left join powerhub_reporting.reporting_country ctry on ctry.iso_3_abbreviation = l.country
+       left join powerhub_reporting.reporting_loan_daily_metrics ldm90 on ldm90.loan_id = l.loan_id and ldm90.days_elapsed = 90  and last_day(ldm90.benchmark_date) = last_day(l.report_date) and l.customer_id = ldm90.customer_id and ldm90.benchmark_date >= '2018-01-01'
+    left join powerhub_reporting.reporting_loan_daily_metrics ldm180 on ldm180.loan_id = l.loan_id and ldm180.days_elapsed = 180 and last_day(ldm180.benchmark_date) = last_day(l.report_date) and l.customer_id = ldm180.customer_id and  ldm180.benchmark_date >= '2018-01-01'
+    LEFT JOIN powerhub_reporting.reporting_loan_daily_metrics ldm60 on ldm60.loan_id = l.loan_id and ldm60.days_elapsed = 60 and last_day(ldm60.benchmark_date) = last_day(l.report_date) and l.customer_id = ldm60.customer_id 
+    and ldm60.benchmark_date >= '2018-01-01'                       
+ left join sensitive.finance_global_finance_calculations_daily c on l.account_id = c.account_id and 
+    l.loan_id = c.loan_id and last_day(c.report_date) = last_day(l.report_date)  
+    left join sensitive.finance_global_finance_calculations_monthly cprev  on l.account_id = cprev.account_id and l.loan_id = cprev.loan_id 
+    and cprev.report_date  =  l.prev_report_date 
+    LEFT JOIN powerhub_reporting.reporting_person_demographics pd ON s.customer_id_fenixdb = pd.person_id 
+    left join analysts_inputs.market_sources_ug_locations loc on NVL(s.sale_location,s.associator_location)  = loc.location
+    left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type = l.product_type
+    left join powerhub_reporting.reporting_loan_current_details lcd on lcd.loan_id = l.loan_id and lcd.customer_id = l.customer_id
+    left join powerhub_reporting.reporting_loan_current_details resch_det on resch_det.loan_id = lcd.restructured_base_loan_id and resch_det.customer_id = lcd.customer_id
+    left join analysts_inputs.credit_missed_first_payment mfp on mfp.loan_id = l.loan_id and mfp.account_id = l.account_id
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates fx ON last_day(l.report_date) = fx.month AND ctry.name = fx.country   
+       left join  powerhub_reporting.eea_migrated_loans_from_fenixdb_to_alms mg on lcd.loan_id = mg.fenixdb_loan_id 
+       
+      left join analysts_inputs.vw_global_sales_channel_region_mapping crm on s.order_item_id::VARCHAR(20) = crm.order_item_id 
+                                                        and crm.source = 'FenixDB' 
+                                                        and s.account_id::VARCHAR(20) = crm.account_id 
+                                                        and nvl(s.loan_id::VARCHAR(20),'') = crm.loan_id 
+                                                        and (s.fulfillment_source IS NULL or s.fulfillment_source <> 'Powerhub')
+
+left join powerhub_reporting.eea_sales_order_items so on s.fulfillment_source = 'Powerhub' 
+                                                       and l.loan_id::VARCHAR(20) = so.loan_account_id
+    
+left join analysts_inputs.vw_global_sales_channel_region_mapping crm2 on so.sales_order_item_id = crm2.order_item_id 
+                                                         and crm2.source = 'Solarhub' 
+                                                         and nvl(so.loan_portfolio_id,'') = crm2.account_id 
+                                                         and nvl(so.loan_account_id,'') = crm2.loan_id
+
+
+   
+--left join analysts_inputs.market_sources_ug_agents agent on NVL(s.sale_location,s.associator_location)  = agent.location2
+
+left join analysts_inputs.market_sources_ug_team_leaders t on  NVL(s.sale_location,s.associator_location)  = t.pos_locations    
+  -- left join payments p on p.loan_id = l.loan_id and p.report_date = l.prev_report_date and p.report_date  >= '2022-01-01' 
+   LEFT JOIN sale_locations sl ON s.sale_location = sl.sale_location
+   
+    where  l.report_date = CURRENT_DATE-1  AND CURRENT_DATE-1 <> LAST_DAY(CURRENT_DATE-1)   --  and l.account_type = 'CREDIT'
+        and date( l.original_loan_started_at_utc) >= '2022-01-01'
+    /*and ( l.original_loan_started_at_utc >= '2016-01-01' OR (l.original_loan_started_at_utc < '2016-01-01' AND l.loan_state = 'In Repayment'))
+    and ( l.current_loan_started_at_utc >= '2016-01-01' OR (l.current_loan_started_at_utc < '2016-01-01' AND l.loan_state = 'In Repayment'))*/
+
+    --  and l.country = 'KEN'
+    and (l.loan_tag is null or l.loan_tag not like '%%Employee%%')
+    and ( l.cancellation_reason  is null or l.cancellation_reason not  in  ('Exchange'))
+    --and cancellation_reason not in ('Exchange')
+    and l.loan_state is not null
+    and  mg.fenixdb_loan_id is null
+-- and l.loan_id = 1827788
+   -- and l.country = 'UGA'
+
+
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
+
+
+
+    UNION ALL 
+
+
+    /*MOBISOL MONTHLY*/ 
+    /*returns the monthly snapshot info in the query per loan per for paygee*/
+    select 
+    -- l.loan_account_id,
+    fix.loan_type,
+    'paygee' as company, 
+    ctry.iso_3_abbreviation as country, 
+    ctry.name as country_of_sale,
+    l.snapshot_at as report_date,
+      extract('year' from fix.handover_at_utc) as cohort_year_og,
+      extract('month' from fix.handover_at_utc) as cohort_month_og,
+    fix.state as loan_state,
+
+    --CASE WHEN coop.loan_account_id IS NOT NULL THEN 1 ELSE 0 END AS coop,
+    CASE WHEN soi.product_name like 'Cooperative%%' THEN 1 ELSE 0 END AS coop,
+    l.external_loan_provider,
+    case when resch.resultant_loan_account_id is not null then 1 else 0 end as rescheduled,
+
+    /*moved hereduring optimisation*/
+ 
+    fx.average_rate as average_rate_usd,
+    fx.end_of_month_rate as eom_rate_usd, 
+
+    case when cd.country = 'TZ' then   split_part(rbe_list_per_area_v4_20240910_2(cd.area2),'~',2)
+    when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when cd.country = 'UG' then loc.region
+    else cd.area1 end as region,
+
+    cd.area2  AS district,
+    
+   nvl(sl.sale_location,case when cd.country = 'TZ' then   split_part(rbe_list_per_area_v4_20240910_2(cd.area2),'~',2)
+    when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when cd.country = 'UG' then loc.region
+    else cd.area1 end) as sale_location,
+   NVL(case 
+    when cd.country = 'UG' then t.tl_name
+    when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2(cd.area2),'~',1)
+   else crm2.agent_lead_name end,  cd.application_coordinator_name) team_lead_name,
+    
+  --  (NVL(crm2.sales_agent_name,cd.application_by_contractor_name)) as sales_agent_name,
+    
+    soi.product_name as product,
+    
+    CASE WHEN (pm.wattage >= 80 and pm.wattage <= 200 )THEN 'High End'
+    WHEN ((pm.wattage >= 21 and pm.wattage <= 79) OR soi.product_name  LIKE '%%TV%%' )THEN 'Medium'
+    WHEN ( pm.wattage <= 20 )THEN 'Entry Level' ELSE 'EXCEPTION'END system_size,
+
+    avg(pcf.days_since_loan_start) as days_elapsed,
+    avg(pcf.days_since_loan_start) as days_since_loan_start,
+   avg(l.months_on_book) as months_since_loan_start,
+   avg((l.days_uncharged) ) as days_locked,
+   avg(l.percent_locked) as percent_locked,
+   avg(soi.loan_duration) as loan_duration,
+   avg(  NVL(soi.daily_rate/100,(NVL(fix.initial_installment,0)/100)/fix.installment_period_days) )as daily_rate,
+   avg(days_since_loan_start - 30) as days_billable,
+   
+       count(distinct l.loan_account_id) as loans_total,        
+    count(distinct fix.loan_portfolio_id)  as accounts_total,
+    sum(  case when l.state not in('canceled', 'defaulted', 'paid_off', 'rescheduled') then l.outstanding_amount else 0 end) as  ar, 
+
+    sum(fix.initial_amount/100) as total_loaned,             
+    
+        /*Payemnts info*/   
+
+    sum(fix.initial_amount/100 - NVL(l.outstanding_amount, 0)) as paid_total,
+sum( soi.down_payment / 100 ) as deposit_amount,
+   
+    sum(case when pcf.days_since_loan_start <= pcf.introductory_period then 0   
+    when pcf.days_since_loan_start > pcf.loan_duration + pcf.introductory_period then pcf.loan_duration * (pcf.daily_rate)  
+    else (pcf.days_since_loan_start - pcf.introductory_period) * (pcf.daily_rate)  end) as expected_all_total,
+
+    sum(0) as discounts_amount_total,
+   sum(0) as  discounts_amount_implied_total,
+    
+  count(distinct case when NVL(l.outstanding_amount_prev - l.outstanding_amount,0)> 0 then fix.loan_portfolio_id end) as customers_made_payment_mtd,
+    sum(case when NVL(l.outstanding_amount_prev - l.outstanding_amount,0) > 0 then 1 else 0 end) as loans_made_payment_mtd,
+
+
+
+    sum(case when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then fix.initial_amount/100 - NVL(l.outstanding_amount, 0) else NVL(l.outstanding_amount_prev - l.outstanding_amount,0)end  ) as paid_mtd,
+    avg(case when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then fix.initial_amount/100 - NVL(l.outstanding_amount, 0) else NVL(l.outstanding_amount_prev - l.outstanding_amount,0) end) as paid_avg_mtd,
+
+  sum( CASE WHEN l.state = 'rescheduled' THEN  0  
+    when cd.country <> 'KE'  and  l.state = 'canceled'  then 0 ---CHNAGE
+    WHEN l.state = 'paid_off' then 0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.introductory_period THEN  0             
+    /*When customer is in the first month then only take days elapsed - introperiod */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) <= extract(day from l.snapshot_at) THEN   
+    (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) * (pcf.daily_rate) 
+    /*When customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    WHEN l.snapshot_at - date(fix.handover_at_utc)  + pcf.introductory_period >  
+    pcf.loan_duration + extract(day from l.snapshot_at) THEN  0   
+    /*When customer is beyond their original loan duration but payoff within the last month then days in the month  
+    are expected  */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) ) + pcf.introductory_period > pcf.loan_duration   
+    THEN  (extract(day from l.snapshot_at)  - cast ((l.snapshot_at - date(fix.handover_at_utc) )as int) - pcf.loan_duration + pcf.introductory_period) * (pcf.daily_rate)   
+    /*Otherwise, the number days in the month times the daily rate*/  
+    ELSE ((pcf.daily_rate)  * extract(day from l.snapshot_at)) end   
+    )
+    WHEN  l.months_on_book < 2 THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN 0  
+    ELSE  NVL(pcf.daily_rate, (NVL(fix.initial_installment,0)/100)/fix.installment_period_days)* extract(day from l.snapshot_at)  END) as expected_all_mtd,
+
+ sum(CASE WHEN l.state = 'rescheduled' THEN  0  
+    WHEN l.state = 'canceled' THEN  0 
+    WHEN l.terminated_at IS NOT NULL THEN   0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.introductory_period THEN  0             
+    /*When customer is in the first month then only take days elapsed - introperiod */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) <= extract(day from l.snapshot_at) THEN   
+    (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) * (pcf.daily_rate) 
+    /*When customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    WHEN l.snapshot_at - date(fix.handover_at_utc)  + pcf.introductory_period >  
+    pcf.loan_duration + extract(day from l.snapshot_at) THEN  0   
+
+    ELSE ((pcf.daily_rate)  * extract(day from l.snapshot_at)) end  )
+    WHEN   l.months_on_book < 2  THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN  0  
+    ELSE  NVL(pcf.daily_rate, (NVL(fix.initial_installment,0)/100)/fix.installment_period_days)* extract(day from l.snapshot_at) 
+    END ) as expected_in_repayment_mtd,   
+
+    sum(CASE WHEN l.state = 'rescheduled' THEN  0  
+    WHEN l.state = 'canceled' THEN  0 
+    WHEN l.terminated_at IS NOT NULL THEN   0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < introductory_period THEN  0             
+
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) ) <= pcf.loan_duration   + introductory_period
+    THEN  (pcf.daily_rate)   
+    end  )
+    WHEN   l.months_on_book < 2  THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN  0  
+
+    ELSE  pcf.daily_rate * extract(day from l.snapshot_at) 
+    END ) as expected_ongoing_mtd,
+
+   
+    sum(extract('day' from l.snapshot_at))  as days_expected_sum_mtd, 
+    avg(case when pcf.daily_rate > 0 then 
+    round(NVL(l.outstanding_amount_prev - l.outstanding_amount,0) / pcf.daily_rate)
+    else NULL end)  as days_paid_avg_mtd,
+
+    sum(0)  as discounts_amount_implied_mtd,
+    sum(0) as  discounts_amount_mtd,
+    sum(0) as  epd_discounts,
+    sum(0) as other_discounts,
+    sum(0) as referral_discount,
+    sum(0) as fees,
+    
+      /*PAR*/ 
+    avg(l.par_days) as par_days,
+    
+
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (l.outstanding_amount_prev - lad.outstanding_amount/100)  else 0 end,0)) as paid_at_6mo, --CHECK
+    
+      sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (fix.initial_amount/100 - lad.outstanding_amount/100)  else 0 end,0)) as cumulative_paid_at_6mo,
+
+
+sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then ( (lad.days_on_book - 30) * pcf.daily_rate)  else 0 end,0)) cumulative_expected_at_6mo,
+    
+        sum (NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )
+    then ( extract(day from lad.snapshot_at) * pcf.daily_rate) end,0) )as expected_at_6mo, ---OR CUMULATIVE--CHECK -- CHANGE TH
+
+    /*Paid @2m*/
+  
+    sum (NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (l.outstanding_amount_prev - lad60.outstanding_amount/100)  else 0 end,0)) as paid_at_2mo, --CHECK
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (fix.initial_amount/100 - lad60.outstanding_amount/100)  else 0 end,0)) as cumulative_paid_at_2mo, --CHECK
+   
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then ( (lad60.days_on_book - 30.5) * pcf.daily_rate)  else 0 end,0)) as cumulative_expected_at_2mo,
+
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )
+    then ( extract(day from lad60.snapshot_at) * pcf.daily_rate) end,0)) as expected_at_2mo, --CHECK
+    
+    
+    /*Paid @3m*/
+  
+    sum (NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (l.outstanding_amount_prev - lad2.outstanding_amount/100)  else 0 end,0)) as paid_at_3mo, --CHECK
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (fix.initial_amount/100 - lad2.outstanding_amount/100)  else 0 end,0)) as cumulative_paid_at_3mo, --CHECK
+   
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then ( (lad2.days_on_book - 30.5) * pcf.daily_rate)  else 0 end,0)) as cumulative_expected_at_3mo,
+
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )
+    then ( extract(day from lad2.snapshot_at) * pcf.daily_rate) end,0)) as expected_at_3mo, --CHECK
+
+ /*PVP*/
+    
+    --paid
+
+ sum(case when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then 0
+ when last_day(date(fix.handover_at_utc)) <> last_day (l.snapshot_at) then  NVL(l.outstanding_amount_prev - l.outstanding_amount,0) else 0  end )  as paid_mtd_pvp,
+
+    --expected
+
+ sum(case  when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then 0
+ when last_day(date(fix.handover_at_utc)) <> last_day (l.snapshot_at) then    ( CASE WHEN l.state = 'rescheduled' THEN  0  
+    when cd.country <> 'KE' and fix.loan_type <> 'paygo'  and  l.state = 'canceled'  then 0 ---CHNAGE
+    WHEN l.state = 'paid_off' then 0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.introductory_period THEN  0             
+    /*When customer is in the first month then only take days elapsed - introperiod */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) <= extract(day from l.snapshot_at) THEN   
+    (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) * (pcf.daily_rate) 
+    /*When customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    WHEN l.snapshot_at - date(fix.handover_at_utc)  + pcf.introductory_period >  
+    pcf.loan_duration + extract(day from l.snapshot_at) THEN  0   
+    /*When customer is beyond their original loan duration but payoff within the last month then days in the month  
+    are expected  */  
+     WHEN (l.snapshot_at - date(fix.handover_at_utc) ) + pcf.introductory_period > pcf.loan_duration   
+    THEN  (extract(day from l.snapshot_at)  - (cast ((l.snapshot_at - date(fix.handover_at_utc) )as int) - pcf.loan_duration) + pcf.introductory_period  )* (pcf.daily_rate)    
+ 
+    /*Otherwise, the number days in the month times the daily rate*/  
+    ELSE ((pcf.daily_rate)  * extract(day from l.snapshot_at)) end   
+    )
+    WHEN  l.months_on_book < 2 THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN 0  
+    ELSE  NVL(pcf.daily_rate, (NVL(fix.initial_installment,0)/100)/fix.installment_period_days)* extract(day from l.snapshot_at)  END) 
+
+ else 0 end) as expected_all_mtd_pvp,
+     
+     
+
+    
+    /*missed payment*/
+    count(CASE WHEN last_day(date(cfp.daily_payment_due_utc_w_grace) )= last_day(l.snapshot_at) AND cfp.missed_first_daily_payment = 1 THEN cfp.customer_id END) 
+    AS accounts_due_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.daily_payment_due_utc_w_grace) ) = last_day(l.snapshot_at) AND cfp.missed_first_daily_payment is not null THEN cfp.customer_id END) AS accounts_due_in_month,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.snapshot_at) AND cfp.missed_first_daily_payment = 1 THEN cfp.customer_id END) 
+    AS accounts_started_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.snapshot_at)  AND  cfp.missed_first_daily_payment is not null  THEN cfp.customer_id END) AS accounts_started_in_month   
+
+   
+    From analysts_inputs.credit_loan_accounts_monthly l 
+        left join paygee_calculated_fileds pcf on pcf.loan_account_id = l.loan_account_id and pcf.customer_id = l.customer_id and l.snapshot_at = pcf.snapshot_at
+    left join powerhub_reporting.eea_loan_reschedule_requests resch on resch.resultant_loan_account_id = l.loan_account_id and l.customer_id = resch.customer_id
+    left join powerhub_reporting.eea_customer_details cd on cd.customer_id = l.customer_id   
+    left join powerhub_reporting.eea_loan_account_details fix  on fix.loan_account_id  = l.loan_account_id and fix.customer_id = l.customer_id
+    left join  powerhub_reporting.reporting_country ctry ON ctry.iso_2_abbreviation = cd.country
+    LEFT JOIN  analysts_inputs.credit_loan_accounts_daily  lad ON lad.customer_id = l.customer_id and lad.loan_account_id = l.loan_account_id  
+    AND lad.days_on_book = 180 and last_day(lad.snapshot_at) = last_day(l.snapshot_at) and lad.snapshot_at >= '2018-01-01'
+    
+    LEFT JOIN  analysts_inputs.credit_loan_accounts_daily  lad2 ON lad2.customer_id = l.customer_id and lad2.loan_account_id = l.loan_account_id  
+    AND lad2.days_on_book = 90 and last_day(lad2.snapshot_at) = last_day(l.snapshot_at )and  lad2.snapshot_at >= '2018-01-01'
+    LEFT JOIN  analysts_inputs.credit_loan_accounts_daily  lad60 ON lad60.customer_id = l.customer_id and lad60.loan_account_id = l.loan_account_id  
+    AND lad60.days_on_book = 60 and last_day(lad60.snapshot_at) = last_day(l.snapshot_at)  and  lad60.snapshot_at >= '2018-01-01' 
+    left join powerhub_reporting.mobisol_cf_util_return_cases_distinct_la as curc on curc.customer_id = l.customer_id AND curc.loan_account_id = l.loan_account_id 
+    left join powerhub_reporting.mobisol_cf_largest_sale_details sd on l.loan_account_id = sd.loan_account_id
+    left join analysts_inputs.credit_cf_missed_first_payments cfp on cfp.loan_account_id =l.loan_account_id and cfp.customer_id = l.customer_id
+
+    LEFT JOIN  powerhub_reporting.eea_sales_order_items                                                                                                                                                                                                                                                                             soi ON soi.loan_account_id = l.loan_account_id AND
+    soi.customer_id = l.customer_id
+    and soi.master_loan_item = 1 
+    and  soi.account_type = 'CREDIT'
+    left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping pm on trim(soi.product_name) = pm.product_type
+    left join powerhub_reporting.eea_sales_cases sc on sc.sales_case_id = soi.sales_case_id
+    /*WAITING*/ left join analysts_inputs.market_sources_ug_locations loc on TRIM (' ' from INITCAP(split_part(sc.hub_name ,'(',1))) = loc.location
+    left join  powerhub_reporting.eea_migrated_loans_from_admin_to_alms m on m.admin_loan_account_id = l.loan_account_id and m.customer_id = l.customer_id                                                                                                                                                                                                                                                                
+
+    -- ingestion tool
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates fx ON last_day(l.snapshot_at) = fx.month AND ctry.name = fx.country   
+    
+
+LEFT JOIN sale_locations sl ON sc.hub_name = sl.hub_name
+
+left join analysts_inputs.vw_global_sales_channel_region_mapping crm2 on soi.sales_order_item_id = crm2.order_item_id 
+
+                                                         and crm2.source = 'Solarhub' 
+                                                         and nvl(soi.loan_portfolio_id,'') = crm2.account_id 
+                                                         and nvl(soi.loan_account_id,'') = crm2.loan_id
+
+--left join analysts_inputs.market_sources_ug_agents agent on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = agent.location2
+
+left join analysts_inputs.market_sources_ug_team_leaders t on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = t.pos_locations  
+
+
+
+
+    where l.snapshot_at   >= CURRENT_DATE - INTERVAL '13 MONTH' 
+    and date(fix.handover_at_utc) >= '2022-01-01'
+    and fix.source  = 'admin'
+  --  and cd.country = 'UG'
+   -- and l.loan_account_id in ('bj_1137') 
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19  --,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+
+union ALL
+
+
+    /*MOBISOL CURRENT*/ 
+    /*returns the most recent daily info in the query per loan per for paygee*/
+        select 
+    -- l.loan_account_id,
+    fix.loan_type,
+    'paygee' as company, 
+    ctry.iso_3_abbreviation as country, 
+    ctry.name as country_of_sale,
+   l.snapshot_at as report_date,
+     extract('year' from fix.handover_at_utc) as cohort_year_og,
+      extract('month' from fix.handover_at_utc) as cohort_month_og,
+    fix.state as loan_state,
+
+    --CASE WHEN coop.loan_account_id IS NOT NULL THEN 1 ELSE 0 END AS coop,
+    CASE WHEN soi.product_name like 'Cooperative%%' THEN 1 ELSE 0 END AS coop,
+    l.external_loan_provider,
+    case when resch.resultant_loan_account_id is not null then 1 else 0 end as rescheduled,
+
+    /*moved hereduring optimisation*/
+ 
+    fx.average_rate as average_rate_usd,
+    fx.end_of_month_rate as eom_rate_usd, 
+
+    case when cd.country = 'TZ' then   split_part(rbe_list_per_area_v4_20240910_2(cd.area2),'~',2)
+    when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when cd.country = 'UG' then loc.region
+    else cd.area1 end as region,
+    -- NVL(smk.regional_manager_name, fix.contractor) as recovery_officer, 
+    cd.area2  AS district,
+    
+   nvl(sl.sale_location,case when cd.country = 'TZ' then   split_part(rbe_list_per_area_v4_20240910_2(cd.area2),'~',2)
+    when cd.country = 'KE' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when cd.country = 'UG' then loc.region
+    else cd.area1 end) as sale_location,
+    NVL(case 
+    when cd.country = 'UG' then t.tl_name
+    when cd.country = 'TZ' then split_part(rbe_list_per_area_v4_20240910_2(cd.area2),'~',1)
+    else crm2.agent_lead_name end,  cd.application_coordinator_name) team_lead_name,
+    
+   -- (NVL( case when  cd.country = 'UG' then agent.associator_name else crm2.sales_agent_name end ,cd.application_by_contractor_name)) as sales_agent_name,
+    
+    soi.product_name as product,
+    CASE WHEN (pm.wattage >= 80 and pm.wattage <= 200 )THEN 'High End'
+    WHEN ((pm.wattage >= 21 and pm.wattage <= 79) OR soi.product_name  LIKE '%%TV%%' )THEN 'Medium'
+    WHEN ( pm.wattage <= 20 )THEN 'Entry Level' ELSE 'EXCEPTION'END system_size,
+
+    avg(pcf.days_since_loan_start )as days_elapsed,
+    avg(pcf.days_since_loan_start) as days_since_loan_start,
+   avg(l.months_on_book) as months_since_loan_start,
+   avg((l.days_uncharged) ) as days_locked,
+   avg(l.percent_locked) as percent_locked,
+   avg(soi.loan_duration) as loan_duration,
+   avg(  NVL(soi.daily_rate/100,(NVL(fix.initial_installment,0)/100)/fix.installment_period_days) )as daily_rate,
+   avg(days_since_loan_start - 30) as days_billable,
+   
+       count(distinct l.loan_account_id) as loans_total,        
+    count(distinct fix.loan_portfolio_id)  as accounts_total,
+    sum(  case when l.state not in('canceled', 'defaulted', 'paid_off', 'rescheduled') then l.outstanding_amount/100 else 0 end) as  ar, 
+
+
+
+    sum(fix.initial_amount/100) as total_loaned,             
+    
+        /*Payemnts info*/   
+
+    sum(fix.initial_amount/100 - NVL(l.outstanding_amount/100, 0)) as paid_total,
+sum( soi.down_payment / 100 ) as deposit_amount,
+   
+sum(case when pcf.days_since_loan_start <= pcf.introductory_period then 0   
+    when pcf.days_since_loan_start > pcf.loan_duration + pcf.introductory_period then pcf.loan_duration * (pcf.daily_rate) 
+    else (pcf.days_since_loan_start - pcf.introductory_period) *(pcf.daily_rate)  end) as expected_all_total,
+
+    sum(0) as discounts_amount_total,
+   sum(0) as  discounts_amount_implied_total,
+    
+  count(distinct case when NVL(pcf.outstanding_amount_prev - l.outstanding_amount/100,0)> 0 then fix.loan_portfolio_id end) as customers_made_payment_mtd,
+    sum(case when NVL(pcf.outstanding_amount_prev - l.outstanding_amount/100,0) > 0 then 1 else 0 end) as loans_made_payment_mtd,
+
+
+      sum(case when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then fix.initial_amount/100 - NVL(l.outstanding_amount/100, 0)else NVL(pcf.outstanding_amount_prev - l.outstanding_amount/100,0)end  )  as paid_mtd,
+
+    avg(case when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then fix.initial_amount/100 -  NVL(l.outstanding_amount/100, 0)  else NVL(pcf.outstanding_amount_prev - l.outstanding_amount/100,0)  end) as paid_avg_mtd,
+
+    sum( CASE WHEN l.state = 'rescheduled' THEN  0  
+    WHEN cd.country <> 'KE' and  l.state = 'canceled' THEN  0 
+    WHEN l.state = 'paid_off' then 0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.introductory_period THEN  0             
+    /*When customer is in the first month then only take days elapsed - introperiod */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) <= extract(day from l.snapshot_at) THEN   
+    (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) * (pcf.daily_rate) 
+    /*When customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    WHEN l.snapshot_at - date(fix.handover_at_utc)  + pcf.introductory_period >  
+    pcf.loan_duration + extract(day from l.snapshot_at) THEN  0   
+    /*When customer is beyond their original loan duration but payoff within the last month then days in the month  
+    are expected  */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) ) + pcf.introductory_period > pcf.loan_duration   
+    THEN  (extract(day from l.snapshot_at)  - cast ((l.snapshot_at - date(fix.handover_at_utc) )as int) - pcf.loan_duration + pcf.introductory_period  )* (pcf.daily_rate)   
+    /*Otherwise, the number days in the month times the daily rate*/  
+    ELSE ((pcf.daily_rate)  * extract(day from l.snapshot_at)) end   
+    )
+    WHEN  l.months_on_book < 2 THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN 0  
+    ELSE  NVL(pcf.daily_rate,(NVL(fix.initial_installment,0)/100)/fix.installment_period_days)* extract(day from l.snapshot_at)  END) as expected_all_mtd,
+
+
+    sum(CASE WHEN l.state = 'rescheduled' THEN  0  
+    WHEN l.state = 'canceled' THEN  0 
+    WHEN l.terminated_at IS NOT NULL THEN   0  
+
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.introductory_period THEN  0             
+    /*When customer is in the first month then only take days elapsed - introperiod */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) <= extract(day from l.snapshot_at) THEN   
+    (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) * (pcf.daily_rate) 
+    /*When customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    WHEN l.snapshot_at - date(fix.handover_at_utc)  + pcf.introductory_period >  
+    pcf.loan_duration + extract(day from l.snapshot_at) THEN  0   
+
+    ELSE ((pcf.daily_rate)  * extract(day from l.snapshot_at)) end  )
+    WHEN   l.months_on_book < 2  THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN  0  
+    ELSE  NVL(pcf.daily_rate,(NVL(fix.initial_installment,0)/100)/fix.installment_period_days )* extract(day from l.snapshot_at) --
+    END ) as expected_in_repayment_mtd,   
+
+  sum(CASE WHEN l.state = 'rescheduled' THEN  0  
+    WHEN l.state = 'canceled' THEN  0 
+    WHEN l.terminated_at IS NOT NULL THEN   0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.prepaid_days_remaining THEN  0             
+
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) ) <= pcf.loan_duration   + pcf.introductory_period
+    THEN  (pcf.daily_rate)   
+    end  )
+    WHEN   l.months_on_book < 2  THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN  0  
+
+    ELSE  NVL(pcf.daily_rate,(NVL(fix.initial_installment,0)/100)/fix.installment_period_days ) * extract(day from l.snapshot_at) 
+    END ) as expected_ongoing_mtd,
+
+   
+    sum(extract('day' from l.snapshot_at))  as days_expected_sum_mtd, 
+    avg(case when pcf.daily_rate > 0 then 
+    round(NVL(pcf.outstanding_amount_prev - l.outstanding_amount/100,0) / pcf.daily_rate)
+    else NULL end)  as days_paid_avg_mtd,
+
+    sum(0)  as discounts_amount_implied_mtd,
+    sum(0) as  discounts_amount_mtd,
+    sum(0) as  epd_discounts,
+    sum(0) as other_discounts,
+    sum(0) as referral_discount,
+    sum(0) as fees,
+    
+    
+
+      /*PAR*/ 
+    avg(l.par_days) as par_days,
+
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (pcf.outstanding_amount_prev - lad.outstanding_amount/100)  else 0 end,0)) as paid_at_6mo, --CHECK
+    
+      sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (fix.initial_amount/100 - lad.outstanding_amount/100)  else 0 end,0)) as cumulative_paid_at_6mo,
+
+sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then ( (lad.days_on_book - 30) * pcf.daily_rate)  else 0 end,0)) cumulative_expected_at_6mo,
+    
+        sum (NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 180, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )
+    then ( extract(day from lad.snapshot_at) * pcf.daily_rate) end,0) )as expected_at_6mo, ---OR CUMULATIVE--CHECK -- CHANGE TH
+
+    /*PAR10@2*/
+  
+    sum (NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (pcf.outstanding_amount_prev - lad60.outstanding_amount/100)  else 0 end,0)) as paid_at_2mo, --CHECK
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (fix.initial_amount/100 - lad60.outstanding_amount/100)  else 0 end,0)) as cumulative_paid_at_2mo, --CHECK
+   
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then ( (lad60.days_on_book - 30.5) * pcf.daily_rate)  else 0 end,0)) as cumulative_expected_at_2mo,
+
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 60, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )
+    then ( extract(day from lad60.snapshot_at) * pcf.daily_rate) end,0)) as expected_at_2mo, --CHECK
+    
+    
+        /*Paid @3m*/
+  
+    sum (NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (pcf.outstanding_amount_prev - lad2.outstanding_amount/100)  else 0 end,0)) as paid_at_3mo, --CHECK
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then (fix.initial_amount/100 - lad2.outstanding_amount/100)  else 0 end,0)) as cumulative_paid_at_3mo, --CHECK
+   
+    
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )  
+    then ( (lad2.days_on_book - 30.5) * pcf.daily_rate)  else 0 end,0)) as cumulative_expected_at_3mo,
+
+    sum(NVL(case when resch.resultant_loan_account_id is  null 
+    and  (last_day(DATEADD(day, 90, date((fix.handover_at_utc)))) = last_day (l.snapshot_at) )
+    then ( extract(day from lad2.snapshot_at) * pcf.daily_rate) end,0)) as expected_at_3mo, --CHECK
+
+     /*PVP*/
+    
+    --paid
+
+ sum(case when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then 0
+ when last_day(date(fix.handover_at_utc)) <> last_day (l.snapshot_at) then  NVL(pcf.outstanding_amount_prev - l.outstanding_amount/100,0)end  )  as paid_mtd_pvp,
+
+    --expected
+    
+
+ sum(case  when last_day(date(fix.handover_at_utc)) = last_day (l.snapshot_at) then 0
+ when last_day(date(fix.handover_at_utc)) <> last_day (l.snapshot_at) then    ( CASE WHEN l.state = 'rescheduled' THEN  0  
+    when cd.country <> 'KE' and fix.loan_type <> 'paygo'  and  l.state = 'canceled'  then 0 ---CHNAGE
+    WHEN l.state = 'paid_off' then 0  
+    WHEN fix.loan_type = 'paygo' then 
+    ( CASE  
+    WHEN l.snapshot_at - date(fix.handover_at_utc) < pcf.introductory_period THEN  0             
+    /*When customer is in the first month then only take days elapsed - introperiod */  
+    WHEN (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) <= extract(day from l.snapshot_at) THEN   
+    (l.snapshot_at - date(fix.handover_at_utc) - pcf.introductory_period) * (pcf.daily_rate) 
+    /*When customer is beyond their original loan duration + days expected in the last month then expect 0*/ 
+    WHEN l.snapshot_at - date(fix.handover_at_utc)  + pcf.introductory_period >  
+    pcf.loan_duration + extract(day from l.snapshot_at) THEN  0   
+    /*When customer is beyond their original loan duration but payoff within the last month then days in the month  
+    are expected  */  
+     WHEN (l.snapshot_at - date(fix.handover_at_utc) ) + pcf.introductory_period > pcf.loan_duration   
+    THEN  (extract(day from l.snapshot_at)  - (cast ((l.snapshot_at - date(fix.handover_at_utc) )as int) - pcf.loan_duration) + pcf.introductory_period  )* (pcf.daily_rate)    
+ 
+    /*Otherwise, the number days in the month times the daily rate*/  
+    ELSE ((pcf.daily_rate)  * extract(day from l.snapshot_at)) end   
+    )
+    WHEN  l.months_on_book < 2 THEN  0  
+    WHEN  l.months_on_book - 2 > fix.installment_periods THEN 0  
+    ELSE  NVL(pcf.daily_rate, (NVL(fix.initial_installment,0)/100)/fix.installment_period_days)* extract(day from l.snapshot_at)  END) 
+
+ else 0 end) as expected_all_mtd_pvp,
+     
+     
+    /*missed payment*/
+    count(CASE WHEN last_day(date(cfp.daily_payment_due_utc_w_grace) )= last_day(l.snapshot_at) AND cfp.missed_first_daily_payment = 1 THEN cfp.customer_id END) 
+    AS accounts_due_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.daily_payment_due_utc_w_grace) ) = last_day(l.snapshot_at) AND cfp.missed_first_daily_payment is not null THEN cfp.customer_id END) AS accounts_due_in_month,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.snapshot_at) AND cfp.missed_first_daily_payment = 1 THEN cfp.customer_id END) 
+    AS accounts_started_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.snapshot_at)  AND  cfp.missed_first_daily_payment is not null  THEN cfp.customer_id END) AS accounts_started_in_month   
+
+   
+    From analysts_inputs.credit_loan_accounts_daily l 
+     left join paygee_calculated_fileds pcf on pcf.loan_account_id = l.loan_account_id and pcf.customer_id = l.customer_id and l.snapshot_at = pcf.snapshot_at
+    left join powerhub_reporting.eea_loan_reschedule_requests resch on resch.resultant_loan_account_id = l.loan_account_id and l.customer_id = resch.customer_id
+    left join powerhub_reporting.eea_customer_details cd on cd.customer_id = l.customer_id   
+    left join powerhub_reporting.eea_loan_account_details fix  on fix.loan_account_id  = l.loan_account_id and fix.customer_id = l.customer_id
+    left join  powerhub_reporting.reporting_country ctry ON ctry.iso_2_abbreviation = cd.country
+    LEFT JOIN  analysts_inputs.credit_loan_accounts_daily  lad ON lad.customer_id = l.customer_id and lad.loan_account_id = l.loan_account_id  
+    AND lad.days_on_book = 180 and last_day(lad.snapshot_at) = last_day(l.snapshot_at) and lad.snapshot_at >= '2018-01-01'
+    LEFT JOIN  analysts_inputs.credit_loan_accounts_daily  lad2 ON lad2.customer_id = l.customer_id and lad2.loan_account_id = l.loan_account_id  
+    AND lad2.days_on_book = 90 and last_day(lad2.snapshot_at) = last_day(l.snapshot_at) and  lad2.snapshot_at >= '2018-01-01'
+    LEFT JOIN  analysts_inputs.credit_loan_accounts_daily  lad60 ON lad60.customer_id = l.customer_id and lad60.loan_account_id = l.loan_account_id  
+    AND lad60.days_on_book = 60 and last_day(lad60.snapshot_at) = last_day(l.snapshot_at)  and  lad60.snapshot_at >= '2018-01-01' 
+    left join powerhub_reporting.mobisol_cf_util_return_cases_distinct_la as curc on curc.customer_id = l.customer_id AND curc.loan_account_id = l.loan_account_id 
+    left join powerhub_reporting.mobisol_cf_largest_sale_details sd on l.loan_account_id = sd.loan_account_id
+    left join analysts_inputs.credit_cf_missed_first_payments cfp on cfp.loan_account_id =l.loan_account_id and cfp.customer_id = l.customer_id
+
+    LEFT JOIN  powerhub_reporting.eea_sales_order_items                                                                                                                                                                                                                                                                             soi ON soi.loan_account_id = l.loan_account_id AND
+    soi.customer_id = l.customer_id
+    and soi.master_loan_item = 1 
+    and  soi.account_type = 'CREDIT'
+    left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping pm on trim(soi.product_name) = pm.product_type
+    left join powerhub_reporting.eea_sales_cases sc on sc.sales_case_id = soi.sales_case_id
+    /*WAITING*/ left join analysts_inputs.market_sources_ug_locations loc on trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1))) = loc.location
+    left join  powerhub_reporting.eea_migrated_loans_from_admin_to_alms m on m.admin_loan_account_id = l.loan_account_id and m.customer_id = l.customer_id                                                                                                                                                                                                                                                                
+
+    -- ingestion tool
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates fx ON last_day(l.snapshot_at) = fx.month AND ctry.name = fx.country   
+
+
+left join analysts_inputs.vw_global_sales_channel_region_mapping crm2 on soi.sales_order_item_id = crm2.order_item_id 
+
+                                                         and crm2.source = 'Solarhub' 
+                                                         and nvl(soi.loan_portfolio_id,'') = crm2.account_id 
+                                                         and nvl(soi.loan_account_id,'') = crm2.loan_id
+
+--left join analysts_inputs.market_sources_ug_agents agent on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = agent.location2
+
+left join analysts_inputs.market_sources_ug_team_leaders t on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = t.pos_locations  
+LEFT JOIN sale_locations sl ON sc.hub_name = sl.hub_name
+
+   where    (l.snapshot_at = CURRENT_DATE-1  AND CURRENT_DATE-1 <> LAST_DAY(CURRENT_DATE-1))
+   and date(fix.handover_at_utc)>= '2022-01-01'
+         and fix.source  = 'admin'
+       --      and cd.country = 'UG'
+  --  and l.loan_account_id in ('bj_1137') 
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 --,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30
+
+
+union all
+    /*ALMS Monthly*/
+        select
+    -- l.loan_id,
+    lcd.loan_type,
+    'alms' as company, 
+    l.country, 
+    ctry.name as country_of_sale,
+    l.report_date, 
+  
+      extract('year' from l.original_loan_started_at_utc) as cohort_year_og,
+      extract('month' from l.original_loan_started_at_utc) as cohort_month_og,
+    l.loan_state,
+
+    0 as coop,
+    lcd.external_loan_provider, 
+    case when l.rescheduled = TRUE then 1 else 0 end as rescheduled,
+
+    fx.average_rate as average_rate_usd,
+    fx.end_of_month_rate as eom_rate_usd, 
+
+    (case when l.country = 'UGA' then loc.region 
+    when l.country = 'KEN' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when l.country = 'MOZ' then cd.area2      
+    else cd.area1 end)  as region, 
+    
+        cd.area2  AS district,
+        
+          nvl(sl.sale_location,case when l.country = 'UGA' then loc.region 
+    when l.country = 'KEN' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when l.country = 'MOZ' then cd.area2      
+    else cd.area1 end) as sale_location, 
+    NVL(case 
+    when cd.country = 'UG' then t.tl_name
+    else crm2.agent_lead_name end,  cd.application_coordinator_name) team_lead_name,
+    
+   -- (NVL( crm2.sales_agent_name,cd.application_by_contractor_name)) as sales_agent_name,
+    
+    -- s.associator_manager_name as recovery_officer,
+   soi.product_name as product,
+
+    CASE WHEN (ptm.wattage >= 80 and ptm.wattage <= 200 )THEN 'High End'
+    WHEN ((ptm.wattage >= 21 and ptm.wattage <= 79) OR l.product_type  LIKE '%%TV%%' )THEN 'Medium'
+    WHEN ( ptm.wattage <= 20 )THEN 'Entry Level' ELSE 'EXCEPTION'END system_size,
+
+
+    /*period information*/
+    avg(l.days_elapsed) as days_elapsed,
+    avg(l.days_since_loan_start) as days_since_loan_start,
+    avg(l.months_since_loan_start) as months_since_loan_start,
+
+    avg(l.days_locked) as days_locked,
+    avg(l.percent_locked) as percent_locked,
+    avg(l.loan_duration) as loan_duration,
+    avg(l.daily_rate) as daily_rate,
+    avg(l.days_billable) as days_billable,
+    
+    /*accounts/loans total*/
+    count(l.loan_id) as loans_total,        
+    count(distinct l.account_id)  as accounts_total,
+ 
+    sum(case when l.country in ('ZMB', 'NGA') then c.accounts_receivable_net_unfin else c.accounts_receivable_all end)  as ar,
+
+sum(case when l.country in ('ZMB', 'NGA') and (l.cancellation_reason is null or l.cancellation_reason not in ('Exchange','Admin','admin','exchange')) 
+    then l.total_principal + l.paid_interest + l.unpaid_accrued_interest 
+    when  (l.cancellation_reason is null or l.cancellation_reason not in ('Exchange','Admin','admin','exchange')) then  l.total_principal + l.total_interest
+    else 0  end) as total_loaned,       
+
+      /*Payemnts info*/   
+
+    sum(l.paid_interest + l.paid_principal) as paid_total,
+    sum(l.paid_deposit) as deposit_amount,
+    sum(case when l.days_since_loan_start <= l.introductory_period then 0   
+    when l.days_since_loan_start > l.loan_duration + l.introductory_period then l.loan_duration * l.daily_rate 
+    else (l.days_since_loan_start - l.introductory_period) *l.daily_rate end) as expected_all_total,
+   
+    sum(l.ready_refer_portion_interest+l.ready_refer_portion_principal+l.other_discounts_portion_interest+l.other_discounts_portion_principal
+    + l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal) as                  discounts_amount_total,
+        sum(l.days_discount * l.daily_rate) as discounts_amount_implied_total,
+ 
+    count(distinct case when l.paid_in_month > 0 then l.account_id end) as customers_made_payment_mtd,          sum(case when l.paid_in_month > 0 then 1 else 0 end) as loans_made_payment_mtd,
+
+    sum(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd,
+    avg(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_avg_mtd,
+    sum(l.expected_in_month_total) as expected_all_mtd,
+    sum(l.expected_in_month_in_repayment) as expected_in_repayment_mtd, 
+    sum(l.expected_in_month_ongoing) as expected_ongoing_mtd, 
+    
+    sum(extract('day' from l.report_date))  as days_expected_sum_mtd, 
+    avg(case when l.daily_rate >0 then round(case when l.paid_in_month > 0 then l.paid_in_month else 0 end
+    / l.daily_rate) else NULL end )  as days_paid_avg_mtd, 
+    
+  
+/*discounts*/
+    sum(NVL(l.implied_discount_amount_in_month,0))  as discounts_amount_implied_mtd,
+    sum(NVL(l.discount_amount_in_month,0)) as  discounts_amount_mtd,
+    sum(NVL(l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal,0)) as epd_discounts, 
+    sum(NVL(l.other_discounts_portion_interest + l.other_discounts_portion_principal,0)) as other_discounts, 
+    sum(NVL(l.ready_refer_portion_principal + l.ready_refer_portion_principal,0))as referral_discount,
+    sum(NVL(l.fees_portion_interest + l.fees_portion_principal,0)) as fees, 
+
+
+        /*PAR*/ 
+avg(l.days_til_lockout *-1) as par_days,
+
+    
+    /*payments at periodic months on book 2 and 6*/
+    
+      --test  
+   -- sum(case when l.country in ('ZMB', 'NGA') then cprev.accounts_receivable_net_unfin else cprev.accounts_receivable_all end) prev_ar,
+    --sum(ldm60.remaining_principal/100 +ldm60.remaining_interest_total/100) remaining,
+    /*paid at 6 months*/
+    /*paid at 6 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)   
+    then  nvl(l.paid_in_month,0)
+     end,0)) as paid_at_6mo,  
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm180.amount_paid_interest/100 + ldm180.amount_paid_principal/100, 0)
+     end,0)) as cumulative_paid_at_6mo,  
+     
+         sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then NVL(ldm180.expected_total/100, ldm180.days_billable * ldm180.daily_rate/100)
+     end,0)) as cumulative_expected_at_6mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then (ldm180.daily_rate/100)  * extract(day from last_day(ldm180.benchmark_date))
+     end,0)) as expected_at_6mo,  
+
+
+
+
+    /*paid at 2 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+   then  nvl(l.paid_in_month,0) end,0)) as paid_at_2mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm60.amount_paid_interest/100 + ldm60.amount_paid_principal/100, 0)
+     end,0)) as cumulative_paid_at_2mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL(ldm60.expected_total/100, ldm60.days_billable * ldm60.daily_rate/100)
+     end,0)) as cumulative_expected_at_2mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (ldm60.daily_rate/100)  * extract(day from last_day(ldm60.benchmark_date))
+     end,0)) as expected_at_2mo,  
+     
+     
+         /*paid at 3 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+   then  nvl(l.paid_in_month,0) end,0)) as paid_at_3mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm90.amount_paid_interest/100 + ldm90.amount_paid_principal/100, 0)
+     end,0)) as cumulative_paid_at_3mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL(ldm90.expected_total/100, ldm90.days_billable * ldm90.daily_rate/100)
+     end,0)) as cumulative_expected_at_3mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (ldm90.daily_rate/100)  * extract(day from last_day(ldm90.benchmark_date))
+     end,0)) as expected_at_3mo,  
+
+
+  /*PVP*/
+    
+    --paid
+ sum(case  when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+ when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) and  l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd_pvp,
+
+    --expected
+    sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+  when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) then l.expected_in_month_total else 0 end) as expected_all_mtd_pvp,
+  
+     
+     
+     
+       /*missed payment*/
+    count(CASE WHEN last_day(date(cfp.first_payment_due_w_grace)) = last_day(l.report_date) AND cfp.missed_first_daily_payment = 1 THEN   cfp.account_id END) 
+    AS accounts_due_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.first_payment_due_w_grace)) = last_day(l.report_date) AND  cfp.missed_first_daily_payment is not null  THEN cfp.account_id END) AS accounts_due_in_month,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.report_date) AND cfp.missed_first_daily_payment = 1 THEN cfp.account_id END) 
+    AS accounts_started_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.report_date)  AND  cfp.missed_first_daily_payment is not null THEN  cfp.account_id END) AS accounts_started_in_month  
+  
+  
+
+    
+    FROM  sensitive.finance_global_finance_report_monthly_alms l 
+        left join powerhub_reporting.reporting_country ctry on ctry.iso_3_abbreviation = l.country
+    left join powerhub_reporting.eea_alms_loan_performance_benchmarks ldm90 on ldm90.loan_id = l.loan_id and ldm90.customer_id = l.customer_id and  ldm90.days_elapsed = 90 and last_day(ldm90.benchmark_date) = l.report_date and   ldm90.benchmark_date >= '2018-01-01'
+    left join powerhub_reporting.eea_alms_loan_performance_benchmarks ldm180 on ldm180.loan_id = l.loan_id and ldm180.customer_id = l.customer_id and ldm180.days_elapsed = 180 and  last_day(ldm180.benchmark_date) = l.report_date and ldm180.benchmark_date >= '2018-01-01'
+    left join powerhub_reporting.eea_alms_loan_performance_benchmarks ldm60 on ldm60.loan_id = l.loan_id and ldm60.customer_id = l.customer_id and ldm60.days_elapsed = 60  and last_day(ldm60.benchmark_date) = l.report_date   and ldm60.benchmark_date >= '2018-01-01'
+   
+      
+    left join sensitive.finance_global_finance_calculations_monthly_alms c on l.loan_id = c.loan_id  and c.report_date  = l.report_date 
+    left join sensitive.finance_global_finance_calculations_monthly_alms cprev  on l.loan_id = cprev.loan_id 
+    and cprev.report_date  =  l.prev_report_date
+    left join powerhub_reporting.eea_sales_order_items                                                                                                                                                                                                                                                                soi on soi.loan_account_id = l.loan_id  and soi.customer_id = l.customer_id
+    left join powerhub_reporting.eea_customer_details cd on cd.customer_id = l.customer_id
+    left join powerhub_reporting.eea_sales_cases sc on sc.sales_case_id = soi.sales_case_id
+    left join analysts_inputs.market_sources_ug_locations loc on trim(' ' FROM initcap(split_part(sc.hub_name, '(',1))) = loc.location
+    left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type = l.product_type
+    left join powerhub_reporting.eea_loan_account_details lcd on lcd.loan_account_id = l.loan_id  and lcd.customer_id  = l.customer_id
+    left join powerhub_reporting.eea_loan_account_details resch_det on resch_det.loan_account_id = l.loan_id and resch_det.rescheduled_at_utc is not null and resch_det.customer_id = l.customer_id
+    LEFT JOIN analysts_inputs.market_sources_customer_finance_fte fte ON fte.month = last_day(l.report_date) AND l.country = fte.country
+    -- ingestion tool
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates fx ON last_day(l.report_date) = fx.month AND ctry.name = fx.country   
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates_usdeur usd ON usd.month_end = last_day(l.report_date)
+    left join analysts_inputs.credit_cf_missed_first_payments_alms cfp on cfp.loan_id = l.loan_id --and mfp.account_id  = l.account_id
+   
+    
+
+
+left join analysts_inputs.vw_global_sales_channel_region_mapping crm2 on soi.sales_order_item_id = crm2.order_item_id 
+
+                                                         and crm2.source = 'Solarhub' 
+                                                         and nvl(soi.loan_portfolio_id,'') = crm2.account_id 
+                                                         and nvl(soi.loan_account_id,'') = crm2.loan_id
+
+--left join analysts_inputs.market_sources_ug_agents agent on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = agent.location2
+
+left join analysts_inputs.market_sources_ug_team_leaders t on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = t.pos_locations  
+LEFT JOIN sale_locations sl ON sc.hub_name = sl.hub_name
+    /*Include only benchmarks over the last 17 month*/ 
+   -- where l.report_date <= '2024-12-31' and l.report_date >= C_LAST_DAY('2024-12-31',-11) AND '2024-12-31' = LAST_DAY( '2024-12-31')
+where l.report_date  >= CURRENT_DATE - INTERVAL '13 MONTH'
+
+    and (l.loan_tag is null or l.loan_tag not like '%%Employee%%')
+    and date(l.original_loan_started_at_utc) >= '2022-01-01'
+    and ( l.cancellation_reason  is null or l.cancellation_reason not  in  ('Exchange','Admin','admin','exchange'))
+       -- and l.country = 'UGA'
+ -- and l.loan_id  = 'bjl_103953'
+    --and cancellation_reason not in ('Exchange')
+    and l.loan_state is not null
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
+
+
+UNION ALL
+
+    /*ALMS CURRENT*/ 
+    /*returns the most recent daily info in the query per loan for alms*/ 
+            select
+    -- l.loan_id,
+    lcd.loan_type,
+    'alms' as company, 
+    l.country, 
+    ctry.name as country_of_sale,
+    l.report_date, 
+      extract('year' from l.original_loan_started_at_utc) as cohort_year_og,
+      extract('month' from l.original_loan_started_at_utc) as cohort_month_og,
+    l.loan_state,
+
+    0 as coop,
+    lcd.external_loan_provider, 
+    case when l.rescheduled = TRUE then 1 else 0 end as rescheduled,
+
+    fx.average_rate as average_rate_usd,
+    fx.end_of_month_rate as eom_rate_usd, 
+
+    (case when l.country = 'UGA' then loc.region 
+    when l.country = 'KEN' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when l.country = 'MOZ' then cd.area2      
+    else cd.area1 end)  as region, 
+    
+        cd.area2  AS district,
+        
+          nvl(sl.sale_location,case when l.country = 'UGA' then loc.region 
+    when l.country = 'KEN' then split_part(udf_ke_stock_points(cd.hub_id),'~',2) 
+    when l.country = 'MOZ' then cd.area2      
+    else cd.area1 end) as sale_location, 
+    NVL(case 
+    when cd.country = 'UG' then t.tl_name
+    else crm2.agent_lead_name end,  cd.application_coordinator_name) team_lead_name,
+    
+      --  (NVL( crm2.sales_agent_name,cd.application_by_contractor_name)) as sales_agent_name,
+    
+    -- s.associator_manager_name as recovery_officer,
+   soi.product_name as product,
+
+    CASE WHEN (ptm.wattage >= 80 and ptm.wattage <= 200 )THEN 'High End'
+    WHEN ((ptm.wattage >= 21 and ptm.wattage <= 79) OR l.product_type  LIKE '%%TV%%' )THEN 'Medium'
+    WHEN ( ptm.wattage <= 20 )THEN 'Entry Level' ELSE 'EXCEPTION'END system_size,
+
+
+    /*period information*/
+    avg(l.days_elapsed) as days_elapsed,
+    avg(l.days_since_loan_start) as days_since_loan_start,
+    avg(l.months_since_loan_start) as months_since_loan_start,
+
+    avg(l.days_locked) as days_locked,
+    avg(l.percent_locked) as percent_locked,
+    avg(l.loan_duration) as loan_duration,
+    avg(l.daily_rate) as daily_rate,
+    avg(l.days_billable) as days_billable,
+    
+    /*accounts/loans total*/
+    count(l.loan_id) as loans_total,        
+    count(distinct l.account_id)  as accounts_total,
+ 
+    sum(case when l.country in ('ZMB', 'NGA') then c.accounts_receivable_net_unfin else c.accounts_receivable_all end)  as ar,
+
+sum(case when l.country in ('ZMB', 'NGA') and (l.cancellation_reason is null or l.cancellation_reason not in ('Exchange','Admin','admin','exchange')) 
+    then l.total_principal + l.paid_interest + l.unpaid_accrued_interest 
+    when  (l.cancellation_reason is null or l.cancellation_reason not in ('Exchange','Admin','admin','exchange')) then  l.total_principal + l.total_interest
+    else 0  end) as total_loaned,       
+
+      /*Payemnts info*/   
+
+    sum(l.paid_interest + l.paid_principal) as paid_total,
+    sum(l.paid_deposit) as deposit_amount,
+    sum(case when l.days_since_loan_start <= l.introductory_period then 0   
+    when l.days_since_loan_start > l.loan_duration + l.introductory_period then l.loan_duration * l.daily_rate 
+    else (l.days_since_loan_start - l.introductory_period) *l.daily_rate end) as expected_all_total,
+   
+    sum(l.ready_refer_portion_interest+l.ready_refer_portion_principal+l.other_discounts_portion_interest+l.other_discounts_portion_principal
+    + l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal) as      discounts_amount_total,
+        sum(l.days_discount * l.daily_rate) as discounts_amount_implied_total,
+ 
+    count(distinct case when l.paid_in_month > 0 then l.account_id end) as customers_made_payment_mtd, sum(case when l.paid_in_month > 0 then 1 else 0 end) as loans_made_payment_mtd,
+
+    sum(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd,
+    avg(case when l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_avg_mtd,
+    sum(l.expected_in_month_total) as expected_all_mtd,
+    sum(l.expected_in_month_in_repayment) as expected_in_repayment_mtd, 
+    sum(l.expected_in_month_ongoing) as expected_ongoing_mtd, 
+    
+    sum(extract('day' from l.report_date))  as days_expected_sum_mtd, 
+    avg(case when l.daily_rate >0 then round(case when l.paid_in_month > 0 then l.paid_in_month else 0 end
+    / l.daily_rate) else NULL end )  as days_paid_avg_mtd, 
+    
+  
+/*discounts*/
+    sum(NVL(l.implied_discount_amount_in_month,0))  as discounts_amount_implied_mtd,
+    sum(NVL(l.discount_amount_in_month,0)) as  discounts_amount_mtd,
+    sum(NVL(l.early_payoff_discount_portion_interest + l.early_payoff_discount_portion_principal,0)) as epd_discounts, 
+    sum(NVL(l.other_discounts_portion_interest + l.other_discounts_portion_principal,0)) as other_discounts, 
+    sum(NVL(l.ready_refer_portion_principal + l.ready_refer_portion_principal,0))as referral_discount,
+    sum(NVL(l.fees_portion_interest + l.fees_portion_principal,0)) as fees, 
+
+
+        /*PAR*/ 
+avg(l.days_til_lockout *-1) as par_days,
+
+    
+    /*payments at periodic months on book 2 and 6*/
+    
+
+        
+    /*paid at 6 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)   
+    then  nvl(l.paid_in_month,0)
+     end,0)) as paid_at_6mo,  
+     
+      sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm180.amount_paid_interest/100 + ldm180.amount_paid_principal/100, 0)
+     end,0)) as cumulative_paid_at_6mo,  
+     
+         sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then NVL(ldm180.expected_total/100, ldm180.days_billable * ldm180.daily_rate/100)
+     end,0)) as cumulative_expected_at_6mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 180, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then (l.daily_rate)  * extract(day from (l.report_date))
+     end,0)) as expected_at_6mo,  
+
+
+
+
+    /*paid at 2 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+   then  nvl(l.paid_in_month,0) end,0)) as paid_at_2mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm60.amount_paid_interest/100 + ldm60.amount_paid_principal/100, 0)
+     end,0)) as cumulative_paid_at_2mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL(ldm60.expected_total/100, ldm60.days_billable * ldm60.daily_rate/100)
+     end,0)) as cumulative_expected_at_2mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 60, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (l.daily_rate)  * extract(day from (l.report_date))
+     end,0)) as expected_at_2mo,  
+  
+     
+             /*paid at 3 months*/
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+   then  nvl(l.paid_in_month,0) end,0)) as paid_at_3mo,  
+     
+     sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL ( ldm90.amount_paid_interest/100 + ldm90.amount_paid_principal/100, 0)
+     end,0)) as cumulative_paid_at_3mo, 
+
+    sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  NVL(ldm90.expected_total/100, ldm90.days_billable * ldm90.daily_rate/100)
+     end,0)) as cumulative_expected_at_3mo,  
+     
+        sum(NVL(case when l.rescheduled = FALSE and 
+    last_day(DATEADD(day, 90, date(l.original_loan_started_at_utc))) = last_day (l.report_date)
+    then  (ldm90.daily_rate/100)  * extract(day from last_day(ldm90.benchmark_date))
+     end,0)) as expected_at_3mo,  
+
+  
+      /*PVP*/
+   
+    --paid
+    
+ sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+ when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) and  l.paid_in_month > 0 then l.paid_in_month else 0 end) as paid_mtd_pvp,
+
+    --expected
+    sum(case when last_day(l.original_loan_started_at_utc) = last_day(l.report_date) then 0
+  when last_day(l.original_loan_started_at_utc) <> last_day(l.report_date) then l.expected_in_month_total else 0 end) as expected_all_mtd_pvp,
+  
+          
+       /*missed payment*/
+    count(CASE WHEN last_day(date(cfp.first_payment_due_w_grace)) = last_day(l.report_date) AND cfp.missed_first_daily_payment = 1 THEN   cfp.account_id END) 
+    AS accounts_due_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.first_payment_due_w_grace)) = last_day(l.report_date) AND  cfp.missed_first_daily_payment is not null  THEN cfp.account_id END) AS accounts_due_in_month,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.report_date) AND cfp.missed_first_daily_payment = 1 THEN cfp.account_id END) 
+    AS accounts_started_in_month_and_missed,
+
+    count(CASE WHEN last_day(date(cfp.handover_at_utc)) = last_day(l.report_date)  AND  cfp.missed_first_daily_payment is not null THEN  cfp.account_id END) AS accounts_started_in_month  
+    
+
+  
+  
+
+ 
+    FROM  sensitive.finance_global_finance_report_daily_alms l
+    left join powerhub_reporting.reporting_country ctry on ctry.iso_3_abbreviation = l.country
+    left join powerhub_reporting.eea_alms_loan_performance_benchmarks ldm90 on ldm90.loan_id = l.loan_id and ldm90.customer_id = l.customer_id and ldm90.days_elapsed = 90 and last_day(ldm90.benchmark_date) = last_day(l.report_date) and ldm90.benchmark_date >= '2018-01-01'
+    left join powerhub_reporting.eea_alms_loan_performance_benchmarks ldm180 on ldm180.loan_id = l.loan_id and ldm180.customer_id = l.customer_id and ldm180.days_elapsed = 180 and last_day(ldm180.benchmark_date) = last_day(l.report_date) and  ldm180.benchmark_date >= '2018-01-01'
+    left join powerhub_reporting.eea_alms_loan_performance_benchmarks ldm60 on ldm60.loan_id = l.loan_id and ldm60.customer_id = l.customer_id and ldm60.days_elapsed = 60  and last_day(ldm60.benchmark_date) = last_day(l.report_date) and  ldm60.benchmark_date >= '2018-01-01'
+    left join sensitive.finance_global_finance_calculations_daily_alms c on l.loan_id = c.loan_id  and last_day(c.report_date) =  last_day(l.report_date)
+    left join sensitive.finance_global_finance_calculations_monthly_alms cprev  on l.loan_id = cprev.loan_id 
+    and cprev.report_date  =  l.prev_report_date 
+    left join  powerhub_reporting.eea_sales_order_items                                                                                                                                                                                                                                                                             soi on soi.loan_account_id = l.loan_id and soi.customer_id = l.customer_id
+    left join powerhub_reporting.eea_customer_details cd on cd.customer_id = l.customer_id
+    left join powerhub_reporting.eea_sales_cases sc on sc.sales_case_id = soi.sales_case_id
+    left join analysts_inputs.market_sources_ug_locations loc on trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1))) = loc.location
+    left join analysts_inputs.market_sources_strategic_marketing_s_and_m_product_mapping ptm on ptm.product_type =    l.product_type
+    left join powerhub_reporting.eea_loan_account_details lcd on lcd.loan_account_id = l.loan_id and lcd.customer_id =  l.customer_id
+    left join powerhub_reporting.eea_loan_account_details resch_det on resch_det.loan_account_id = l.loan_id and resch_det.rescheduled_at_utc is not null and resch_det.customer_id = l.customer_id
+    LEFT JOIN analysts_inputs.market_sources_customer_finance_fte fte ON fte.month = last_day(l.report_date) AND l.country  =  fte.country
+    -- ingestion tool
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates fx ON last_day(l.report_date) = fx.month AND ctry.name = fx.country   
+    LEFT JOIN analysts_inputs.market_sources_finance_a_and_r_fx_rates_usdeur usd ON usd.month_end = last_day(l.report_date)
+    left join analysts_inputs.credit_cf_missed_first_payments_alms cfp on cfp.loan_id = l.loan_id 
+        
+    
+
+left join analysts_inputs.vw_global_sales_channel_region_mapping crm2 on soi.sales_order_item_id = crm2.order_item_id 
+
+                                                         and crm2.source = 'Solarhub' 
+                                                         and nvl(soi.loan_portfolio_id,'') = crm2.account_id 
+                                                         and nvl(soi.loan_account_id,'') = crm2.loan_id
+
+--left join analysts_inputs.market_sources_ug_agents agent on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = agent.location2
+
+left join analysts_inputs.market_sources_ug_team_leaders t on  trim(' ' FROM initcap(split_part(sc.hub_name, '(', 1)))  = t.pos_locations  
+LEFT JOIN sale_locations sl ON sc.hub_name = sl.hub_name
+
+    -- Include only benchmarks over the last 17 month*/ 
+    WHERE  
+
+    (l.report_date = CURRENT_DATE-1  AND CURRENT_DATE-1  <> LAST_DAY(CURRENT_DATE-1))
+and date(l.original_loan_started_at_utc) >= '2022-01-01'
+    and (l.loan_tag is null or l.loan_tag not like '%%Employee%%')
+    and ( l.cancellation_reason  is null or l.cancellation_reason not  in  ('Exchange','Admin','admin','exchange'))
+    and l.loan_state is not null
+   -- and l.country = 'UGA'
+-- and l.loan_id   = 'bjl_103953'  --in ( 'bjl_264849','bjl_201923')
+    group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
